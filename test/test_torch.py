@@ -91,6 +91,56 @@ torch.cuda.synchronize()
 d = (c16.cpu().float() - (a16.cpu().float() @ b16.cpu().float())).abs().max().item()
 print(f"  fp16 128: maxdiff={d:.2e} (fallback)")
 
+# complex128 (Zgemm 回退: 拆 4×fp64 GEMM; 注意 complex linear = x@w^T 不共轭!)
+for (m, n, k) in [(16, 16, 16), (33, 65, 17), (128, 256, 320), (512, 256, 768)]:
+    a = torch.randn(m, k, device=dev, dtype=torch.complex128)
+    b = torch.randn(k, n, device=dev, dtype=torch.complex128)
+    c = a @ b
+    torch.cuda.synchronize()
+    d = (c.cpu() - a.cpu() @ b.cpu()).abs().max().item()
+    bad += 0 if d < 1e-8 else 1
+    print(f"  z64 matmul {m}x{n}x{k}: maxdiff={d:.2e} {'OK' if d < 1e-8 else 'FAIL'}")
+
+# complex128 batched (bmm)
+a = torch.randn(3, 64, 32, device=dev, dtype=torch.complex128)
+b = torch.randn(3, 32, 48, device=dev, dtype=torch.complex128)
+c = torch.bmm(a, b)
+torch.cuda.synchronize()
+d = (c.cpu() - torch.bmm(a.cpu(), b.cpu())).abs().max().item()
+bad += 0 if d < 1e-8 else 1
+print(f"  z64 bmm 3x64x32x48: maxdiff={d:.2e} {'OK' if d < 1e-8 else 'FAIL'}")
+
+# complex128 linear: x @ W.t() (不共轭)
+x = torch.randn(64, 128, device=dev, dtype=torch.complex128)
+w = torch.randn(256, 128, device=dev, dtype=torch.complex128)
+c = x @ w.t()
+torch.cuda.synchronize()
+d = (c.cpu() - x.cpu() @ w.cpu().t()).abs().max().item()
+bad += 0 if d < 1e-8 else 1
+print(f"  z64 linear x@W.t 64x128x256: maxdiff={d:.2e} {'OK' if d < 1e-8 else 'FAIL'}")
+
+# complex128 非连续 x.t()@w
+x = torch.randn(97, 33, device=dev, dtype=torch.complex128)
+w = torch.randn(97, 65, device=dev, dtype=torch.complex128)
+c = x.t() @ w
+torch.cuda.synchronize()
+d = (c.cpu() - x.t().cpu() @ w.cpu()).abs().max().item()
+bad += 0 if d < 1e-8 else 1
+print(f"  z64 x.t()@w 33x97x65: maxdiff={d:.2e} {'OK' if d < 1e-8 else 'FAIL'}")
+
+# complex128 alpha/beta: addmm (复数 alpha/beta)
+a = torch.randn(64, 128, device=dev, dtype=torch.complex128)
+b = torch.randn(128, 96, device=dev, dtype=torch.complex128)
+c0 = torch.randn(64, 96, device=dev, dtype=torch.complex128)
+alpha = torch.complex(torch.tensor(0.5), torch.tensor(-0.25)).to(dev)
+beta = torch.complex(torch.tensor(1.5), torch.tensor(0.75)).to(dev)
+out = torch.addmm(c0, a, b, beta=beta, alpha=alpha)
+torch.cuda.synchronize()
+ref = beta.cpu() * c0.cpu() + alpha.cpu() * (a.cpu() @ b.cpu())
+d = (out.cpu() - ref).abs().max().item()
+bad += 0 if d < 1e-8 else 1
+print(f"  z64 addmm alpha/beta complex: maxdiff={d:.2e} {'OK' if d < 1e-8 else 'FAIL'}")
+
 print(f"\n=== {'ALL PASS' if bad == 0 else f'{bad} FAILURES'} ===\n")
 
 # ---- 性能 ----

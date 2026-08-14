@@ -69,3 +69,17 @@ int vkblas_gemm_f64(
     void* C, uint32_t ldc,
     uint32_t batch,
     int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
+// complex128 GEMM: A/B/C 为 complex 交错 (16B/元素), alpha/beta 拆实虚
+// 内部: 拆 4 次 fp64 GEMM (ArBr-AiBi + i(ArBi+AiBr)) + cx_combine_d64
+// 返回 0=已处理, 非 0=引擎不可用 (调用方应转发真库)
+int vkblas_gemm_z64(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    double alpha_r, double alpha_i,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    double beta_r, double beta_i,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);

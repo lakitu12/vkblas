@@ -118,6 +118,19 @@ static hipblasStatus_t vk_gemm_strided_c64(hipblasHandle_t handle,
                                            const hipComplex* BP, int ldb, long long strideB,
                                            const hipComplex* beta, hipComplex* CP, int ldc, long long strideC,
                                            int batchCount);
+static hipblasStatus_t vk_gemm_z64(hipblasHandle_t handle,
+                                   hipblasOperation_t transA, hipblasOperation_t transB,
+                                   int m, int n, int k,
+                                   const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda,
+                                   const hipDoubleComplex* BP, int ldb,
+                                   const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc);
+static hipblasStatus_t vk_gemm_strided_z64(hipblasHandle_t handle,
+                                           hipblasOperation_t transA, hipblasOperation_t transB,
+                                           int m, int n, int k,
+                                           const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda, long long strideA,
+                                           const hipDoubleComplex* BP, int ldb, long long strideB,
+                                           const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc, long long strideC,
+                                           int batchCount);
 static hipblasStatus_t vk_gemm_f32(hipblasHandle_t handle,
                                    hipblasOperation_t transA, hipblasOperation_t transB,
                                    int m, int n, int k,
@@ -346,14 +359,16 @@ hipblasStatus_t hipblasCgemmStridedBatched_v2(hipblasHandle_t handle, hipblasOpe
 hipblasStatus_t hipblasZgemm_v2(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
                                 int m, int n, int k, const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda,
                                 const hipDoubleComplex* BP, int ldb, const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc) {
-    return FWD(hipblasZgemm_v2, handle, transA, transB, m, n, k, alpha, AP, lda, BP, ldb, beta, CP, ldc);
+    if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
+    return vk_gemm_z64(handle, transA, transB, m, n, k, alpha, AP, lda, BP, ldb, beta, CP, ldc);
 }
 hipblasStatus_t hipblasZgemmStridedBatched_v2(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
                                               int m, int n, int k, const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda, long long strideA,
                                               const hipDoubleComplex* BP, int ldb, long long strideB, const hipDoubleComplex* beta,
                                               hipDoubleComplex* CP, int ldc, long long strideC, int batchCount) {
-    return FWD(hipblasZgemmStridedBatched_v2, handle, transA, transB, m, n, k, alpha, AP, lda, strideA,
-               BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
+    if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
+    return vk_gemm_strided_z64(handle, transA, transB, m, n, k, alpha, AP, lda, strideA,
+                               BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
 }
 
 // ---------- complex64 GEMM 回退 (Vulkan) ----------
@@ -398,6 +413,53 @@ static hipblasStatus_t vk_gemm_strided_c64(hipblasHandle_t handle,
         (uint32_t)batchCount, strideB, strideA, strideC);
     if (st != 0) {
         return FWD(hipblasCgemmStridedBatched_v2, handle, transA, transB, m, n, k,
+                   alpha, AP, lda, strideA, BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
+// ---------- complex128 GEMM 回退 (Vulkan) ----------
+// hipDoubleComplex = {double x, y} 交错; 拆 4×fp64 GEMM (d64 引擎)
+static hipblasStatus_t vk_gemm_z64(hipblasHandle_t handle,
+                                   hipblasOperation_t transA, hipblasOperation_t transB,
+                                   int m, int n, int k,
+                                   const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda,
+                                   const hipDoubleComplex* BP, int ldb,
+                                   const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc) {
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    hipStreamSynchronize(g_stream);
+    int st = vkblas_gemm_z64(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        alpha->x, alpha->y, BP, (uint32_t)ldb, AP, (uint32_t)lda,
+        beta->x, beta->y, CP, (uint32_t)ldc,
+        1, 0, 0, 0);
+    if (st != 0) {  // 引擎不可用 → 转发真库
+        return FWD(hipblasZgemm_v2, handle, transA, transB, m, n, k, alpha, AP, lda,
+                   BP, ldb, beta, CP, ldc);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
+static hipblasStatus_t vk_gemm_strided_z64(hipblasHandle_t handle,
+                                           hipblasOperation_t transA, hipblasOperation_t transB,
+                                           int m, int n, int k,
+                                           const hipDoubleComplex* alpha, const hipDoubleComplex* AP, int lda, long long strideA,
+                                           const hipDoubleComplex* BP, int ldb, long long strideB,
+                                           const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc, long long strideC,
+                                           int batchCount) {
+    if (m <= 0 || n <= 0 || k <= 0 || batchCount <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    hipStreamSynchronize(g_stream);
+    int st = vkblas_gemm_z64(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        alpha->x, alpha->y, BP, (uint32_t)ldb, AP, (uint32_t)lda,
+        beta->x, beta->y, CP, (uint32_t)ldc,
+        (uint32_t)batchCount, strideB, strideA, strideC);
+    if (st != 0) {
+        return FWD(hipblasZgemmStridedBatched_v2, handle, transA, transB, m, n, k,
                    alpha, AP, lda, strideA, BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
     }
     return HIPBLAS_STATUS_SUCCESS;

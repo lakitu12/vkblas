@@ -1,0 +1,29 @@
+#version 450
+// cvt_cz: complex128 (2×double 交错) → double 平面 (实部/虚部分离)
+// 每线程 1 元素; 纯 uint 搬运 (complex128 元素=16B=4 uint; 平面 double=8B=2 uint)
+// 布局不变: 行步长元素单位不变 (complex=16B, 平面=8B)
+// D0: complex128 交错 (元素 i: 实部 D0[4*i..4*i+1], 虚部 D0[4*i+2..4*i+3])
+// D1: OutR 平面, D2: OutI 平面
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer B0 { uint D0[]; };
+layout(set = 0, binding = 1) buffer B1 { uint D1[]; };
+layout(set = 0, binding = 2) buffer B2 { uint D2[]; };
+layout(push_constant) uniform Params {
+    uint R, C;      // 有效行列 (总尺寸)
+    uint ldin;      // 输入行步长 (元素)
+    uint ldout;     // 输出行步长 (元素)
+    uint roff;      // 本 dispatch 的行偏移 (分块)
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.R * p.C) return;
+    uint r = p.roff + gid / p.C;
+    uint c = gid % p.C;
+    uint i0 = r * p.ldin + c;
+    uint o0 = r * p.ldout + c;
+    D1[2u * o0]     = D0[4u * i0];
+    D1[2u * o0 + 1u] = D0[4u * i0 + 1u];
+    D2[2u * o0]     = D0[4u * i0 + 2u];
+    D2[2u * o0 + 1u] = D0[4u * i0 + 3u];
+}

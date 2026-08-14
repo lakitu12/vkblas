@@ -15,6 +15,7 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm_d64_nn.spv $(SHADER_DIR)/gemm_d64_tn.spv \
           $(SHADER_DIR)/gemm_d64_nt.spv $(SHADER_DIR)/gemm_d64_tt.spv \
           $(SHADER_DIR)/transpose_d64.spv \
+          $(SHADER_DIR)/cvt_cz_planar.spv $(SHADER_DIR)/cx_combine_d64.spv \
 
 all: libvkblas_hipblas.so test/test_gemm
 
@@ -42,6 +43,10 @@ $(SHADER_DIR)/cvt_cx_planar.spv: $(SHADER_DIR)/cvt_cx.comp
 $(SHADER_DIR)/cvt_cx_inter.spv: $(SHADER_DIR)/cvt_cx.comp
 	glslangValidator -V -DCX_PLANAR=0 $< -o $@
 $(SHADER_DIR)/cx_combine.spv: $(SHADER_DIR)/cx_combine.comp
+	glslangValidator -V $< -o $@
+$(SHADER_DIR)/cvt_cz_planar.spv: $(SHADER_DIR)/cvt_cz.comp
+	glslangValidator -V $< -o $@
+$(SHADER_DIR)/cx_combine_d64.spv: $(SHADER_DIR)/cx_combine_d64.comp
 	glslangValidator -V $< -o $@
 $(SHADER_DIR)/gemm_d64_nn.spv: $(SHADER_DIR)/gemm_d64_tmpl.comp
 	glslangValidator -V -DTA=0 -DTB=0 $< -o $@
