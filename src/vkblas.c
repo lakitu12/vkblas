@@ -335,13 +335,6 @@ static void init_vkblas(void) {
         vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &dtcp, NULL, &g.d64tpipe), "d64 tpipe");
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
-    if (load_spv("d64_dbg_dump.spv", &sm) == 0) {
-        VkComputePipelineCreateInfo dcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
-                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
-            .layout = g.d64pl };
-        vkDestroyShaderModule(g.dev, sm, NULL);
-    }
 
     g.ready = 1;
     g.init_done = 1;

@@ -42,6 +42,36 @@ d = (c.cpu() - x.cpu() @ w.cpu().t()).abs().max().item()
 bad += 0 if d < 0.1 else 1
 print(f"  linear x@W.t 128x256x512: maxdiff={d:.2e} {'OK' if d < 0.1 else 'FAIL'}")
 
+# 坏项回归: fp32 非连续 x.t()@w (真库 Ailk_Bjlk->802 坏, vkblas 已根治)
+# x 连续 [K,M], x.t() 是 [M,K] 转置视图 (stride=(1,K)) → hipblas transA=T
+for (M, K, N) in [(33, 97, 65), (128, 256, 128), (512, 768, 256)]:
+    x = torch.randn(K, M, device=dev)
+    w = torch.randn(K, N, device=dev)
+    c = x.t() @ w
+    torch.cuda.synchronize()
+    d = (c.cpu() - x.t().cpu() @ w.cpu()).abs().max().item()
+    bad += 0 if d < 0.1 else 1
+    print(f"  x.t()@w {M}x{K}x{N}: maxdiff={d:.2e} {'OK' if d < 0.1 else 'FAIL'}")
+
+# batched 转置 A: (B,K,M).transpose(1,2) @ (B,K,N)
+x = torch.randn(3, 256, 320, device=dev)
+w = torch.randn(3, 256, 128, device=dev)
+c = x.transpose(1, 2) @ w
+torch.cuda.synchronize()
+d = (c.cpu() - x.transpose(1, 2).cpu() @ w.cpu()).abs().max().item()
+bad += 0 if d < 0.1 else 1
+print(f"  bmm xt@w 3x320x256x128: maxdiff={d:.2e} {'OK' if d < 0.1 else 'FAIL'}")
+
+# alpha/beta: addmm(bias, x.t(), w) — beta 乘 bias (无 C 参数)
+x = torch.randn(256, 320, device=dev)
+w = torch.randn(256, 128, device=dev)
+bias = torch.randn(128, device=dev)
+out = torch.addmm(bias, x.t(), w, beta=0.5, alpha=2.5)
+torch.cuda.synchronize()
+d = (out.cpu() - (0.5 * bias.cpu() + 2.5 * (x.t().cpu() @ w.cpu()))).abs().max().item()
+bad += 0 if d < 0.1 else 1
+print(f"  addmm xt@w alpha=2.5 beta=0.5: maxdiff={d:.2e} {'OK' if d < 0.1 else 'FAIL'}")
+
 # alpha/beta (addmm)
 a = torch.randn(256, 256, device=dev)
 b = torch.randn(256, 256, device=dev)
