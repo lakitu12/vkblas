@@ -18,6 +18,11 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm128_b16_nn.spv $(SHADER_DIR)/gemm128_b16_tn.spv \
           $(SHADER_DIR)/gemm128_b16_nt.spv $(SHADER_DIR)/gemm128_b16_tt.spv \
           $(SHADER_DIR)/transpose_h16.spv $(SHADER_DIR)/transpose_b16.spv \
+          $(SHADER_DIR)/gemm_sk_nn.spv $(SHADER_DIR)/gemm_sk_tn.spv \
+          $(SHADER_DIR)/gemm_sk_nt.spv $(SHADER_DIR)/gemm_sk_tt.spv \
+          $(SHADER_DIR)/gemm_sk128_nn.spv $(SHADER_DIR)/gemm_sk128_tn.spv \
+          $(SHADER_DIR)/gemm_sk128_nt.spv $(SHADER_DIR)/gemm_sk128_tt.spv \
+          $(SHADER_DIR)/split_k_reduce.spv \
           $(SHADER_DIR)/transpose.spv \
           $(SHADER_DIR)/cvt_b2f.spv $(SHADER_DIR)/cvt_b2f_tsp.spv \
           $(SHADER_DIR)/cvt_f2b.spv $(SHADER_DIR)/cvt_f2b_atomic.spv \
@@ -52,6 +57,25 @@ $(SHADER_DIR)/gemm128_nt.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
 	glslangValidator -V -DTA=0 -DTB=1 $< -o $@
 $(SHADER_DIR)/gemm128_tt.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
 	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
+# --- split-k (llama.cpp 借鉴: K 分段并行 + reduce 归约) ---
+$(SHADER_DIR)/gemm_sk_nn.spv: $(SHADER_DIR)/gemm_sk_tmpl.comp
+	glslangValidator -V -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_sk_tn.spv: $(SHADER_DIR)/gemm_sk_tmpl.comp
+	glslangValidator -V -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_sk_nt.spv: $(SHADER_DIR)/gemm_sk_tmpl.comp
+	glslangValidator -V -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_sk_tt.spv: $(SHADER_DIR)/gemm_sk_tmpl.comp
+	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_sk128_nn.spv: $(SHADER_DIR)/gemm_sk_128_tmpl.comp
+	glslangValidator -V -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_sk128_tn.spv: $(SHADER_DIR)/gemm_sk_128_tmpl.comp
+	glslangValidator -V -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_sk128_nt.spv: $(SHADER_DIR)/gemm_sk_128_tmpl.comp
+	glslangValidator -V -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_sk128_tt.spv: $(SHADER_DIR)/gemm_sk_128_tmpl.comp
+	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/split_k_reduce.spv: $(SHADER_DIR)/split_k_reduce.comp
+	glslangValidator -V $< -o $@
 # --- f16/bf16 直通 (HALF_TYPE=1 fp16 / 2 bf16): v6 与 v7-128, 4 变体 + 转置 ---
 $(SHADER_DIR)/gemm_h16_nn.spv: $(SHADER_DIR)/gemm_tmpl_h.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@

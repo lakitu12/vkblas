@@ -1,0 +1,147 @@
+#version 450
+// GEMM f32 v6 + split-k: tile 64×64 (同 gemm_tmpl.comp), 但 K 切成多段并行
+// dispatch x = Mt × split_k; ik = wgx / Mt → 本 wg 负责 [ik*k_split, min(K, (ik+1)*k_split))
+// 输出纯部分和 (无 alpha/beta) → Sk[ik*M*N + m*N + n] (紧密), reduce 统一处理 alpha/beta
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer A_buf { float A[]; };
+layout(set = 0, binding = 1) buffer B_buf { float B[]; };
+layout(set = 0, binding = 2) buffer Sk_buf { float Sk[]; };
+
+layout(push_constant) uniform Params {
+    uint M, N, K;
+    uint Mt, Nt, Kt;
+    uint lda, ldb, ldc;
+    float alpha, beta;
+    uint k_split;
+} p;
+
+shared float As[32][66];
+shared float Bs[32][66];
+
+void load_tile(uint kt, uint tgx) {
+    uint base_k = kt * 32;
+    uint base_m = tgx * 64;
+    uint base_n = gl_WorkGroupID.y * 64;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16 + lx;
+
+    uint a_row4 = (tid >> 4) * 4;
+    uint a_col2 = (tid & 15) * 2;
+#if TA == 1
+    for (int c = 0; c < 2; c++) {
+        uint ak = base_k + a_col2 + c;
+        uint am = base_m + a_row4;
+        if (ak < p.K && am + 3 < p.M) {
+            vec4 v = vec4(A[ak * p.lda + am], A[ak * p.lda + am + 1],
+                          A[ak * p.lda + am + 2], A[ak * p.lda + am + 3]);
+            As[a_col2 + c][a_row4 + 0] = v.x; As[a_col2 + c][a_row4 + 1] = v.y;
+            As[a_col2 + c][a_row4 + 2] = v.z; As[a_col2 + c][a_row4 + 3] = v.w;
+        } else {
+            for (int i = 0; i < 4; i++) {
+                uint mm = am + uint(i);
+                As[a_col2 + c][a_row4 + i] = (ak < p.K && mm < p.M) ? A[ak * p.lda + mm] : 0.0;
+            }
+        }
+    }
+#else
+    for (int r = 0; r < 4; r++) {
+        uint am = base_m + a_row4 + r;
+        uint ak = base_k + a_col2;
+        if (am < p.M && ak + 1 < p.K) {
+            vec2 v = vec2(A[am * p.lda + ak], A[am * p.lda + ak + 1]);
+            As[a_col2 + 0][a_row4 + r] = v.x; As[a_col2 + 1][a_row4 + r] = v.y;
+        } else {
+            for (int c = 0; c < 2; c++) {
+                uint kk = ak + uint(c);
+                As[a_col2 + c][a_row4 + r] = (am < p.M && kk < p.K) ? A[am * p.lda + kk] : 0.0;
+            }
+        }
+    }
+#endif
+
+    uint b_row2 = (tid >> 4) * 2;
+    uint b_col4 = (tid & 15) * 4;
+#if TB == 1
+    for (int r = 0; r < 4; r++) {
+        uint n = base_n + b_col4 + r;
+        uint krow = base_k + b_row2;
+        float vb0 = (n < p.N && krow < p.K) ? B[n * p.ldb + krow] : 0.0;
+        float vb1 = (n < p.N && krow + 1 < p.K) ? B[n * p.ldb + krow + 1] : 0.0;
+        Bs[b_row2][b_col4 + r] = vb0;
+        Bs[b_row2 + 1][b_col4 + r] = vb1;
+    }
+#else
+    for (int r = 0; r < 2; r++) {
+        uint krow = base_k + b_row2 + r;
+        uint n = base_n + b_col4;
+        if (krow < p.K && n + 3 < p.N) {
+            vec4 v = vec4(B[krow * p.ldb + n], B[krow * p.ldb + n + 1],
+                          B[krow * p.ldb + n + 2], B[krow * p.ldb + n + 3]);
+            Bs[b_row2 + r][b_col4 + 0] = v.x; Bs[b_row2 + r][b_col4 + 1] = v.y;
+            Bs[b_row2 + r][b_col4 + 2] = v.z; Bs[b_row2 + r][b_col4 + 3] = v.w;
+        } else {
+            for (int c = 0; c < 4; c++) {
+                uint nn = n + uint(c);
+                Bs[b_row2 + r][b_col4 + c] = (krow < p.K && nn < p.N) ? B[krow * p.ldb + nn] : 0.0;
+            }
+        }
+    }
+#endif
+}
+
+void main() {
+    // split-k 解算: dispatch x = Mt × split_k, ik = wgx / Mt, tgx = wgx % Mt
+    uint ik = gl_WorkGroupID.x / p.Mt;
+    uint tgx = gl_WorkGroupID.x % p.Mt;
+    uint start_k = ik * p.k_split;
+    uint end_k = min(p.K, (ik + 1) * p.k_split);
+
+    uint tgy = gl_WorkGroupID.y;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint base_m = tgx * 64, base_n = tgy * 64;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = 0.0;
+
+    uint start_kt = start_k / 32;
+    uint end_kt = (end_k + 31) / 32;
+
+    load_tile(start_kt, tgx);
+    barrier();
+
+    for (uint kt = start_kt; kt < end_kt; kt++) {
+        for (int kk = 0; kk < 32; kk++) {
+            float arow[4], brow[4];
+            arow[0] = As[kk][ly * 4 + 0];
+            arow[1] = As[kk][ly * 4 + 1];
+            arow[2] = As[kk][ly * 4 + 2];
+            arow[3] = As[kk][ly * 4 + 3];
+            brow[0] = Bs[kk][lx * 4 + 0];
+            brow[1] = Bs[kk][lx * 4 + 1];
+            brow[2] = Bs[kk][lx * 4 + 2];
+            brow[3] = Bs[kk][lx * 4 + 3];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] += arow[i] * brow[j];
+        }
+        barrier();
+        if (kt + 1 < end_kt) {
+            load_tile(kt + 1, tgx);
+            barrier();
+        }
+    }
+
+    // 输出纯部分和到 Sk[ik*M*N + m*N + n] (紧密), alpha/beta 由 reduce 处理
+    uint base_sk = ik * p.M * p.N;
+    for (int i = 0; i < 4; i++) {
+        uint row = base_m + ly * 4 + i;
+        if (row >= p.M) continue;
+        for (int j = 0; j < 4; j++) {
+            uint col = base_n + lx * 4 + j;
+            if (col < p.N)
+                Sk[base_sk + row * p.N + col] = acc[i][j];
+        }
+    }
+}

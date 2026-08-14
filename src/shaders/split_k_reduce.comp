@@ -1,0 +1,24 @@
+#version 450
+// split-k reduce: Sk[split_k][M][N] 紧密 → C[M][N] (ldc)
+// C[m][n] = alpha * Σk Sk[k*M*N + m*N+n] + beta * C[m*ldc+n]
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Sk_buf { float Sk[]; };
+layout(set = 0, binding = 1) buffer C_buf { float C[]; };
+layout(push_constant) uniform Params {
+    uint ne;        // M*N
+    uint k_num;     // split_k
+    uint N;
+    uint ldc;
+    float alpha, beta;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.ne) return;
+    float s = 0.0;
+    for (uint k = 0; k < p.k_num; k++)
+        s += Sk[k * p.ne + gid];
+    uint m = gid / p.N, n = gid % p.N;
+    float cval = (p.beta != 0.0) ? C[m * p.ldc + n] : 0.0;
+    C[m * p.ldc + n] = p.alpha * s + p.beta * cval;
+}

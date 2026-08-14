@@ -42,6 +42,13 @@ static struct {
     VkPipeline pipe_h[2][4];
     VkPipeline pipe128_h[2][4];
     VkPipeline tpipe_h[2];
+    // split-k (llama.cpp 借鉴: K 分段并行 + reduce 归约); 仅 fp32
+    VkPipeline pipe_sk[4];        // v6 tile split-k 4 变体
+    VkPipeline pipe_sk128[4];     // v7-128 tile split-k 4 变体
+    VkPipeline sk_reduce_pipe;
+    VkDeviceMemory sk_mem;
+    VkBuffer sk_buf;
+    size_t sk_buf_size;
     VkDescriptorSet dset;
     // 转置 (TB=0 快路径支持)
     VkDescriptorSetLayout tdsl;
@@ -205,7 +212,7 @@ static void init_vkblas(void) {
         .bindingCount = 3, .pBindings = bnds };
     vk_check(vkCreateDescriptorSetLayout(g.dev, &dslci, NULL, &g.dsl), "ds layout");
 
-    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 44 };
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 48 };
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &g.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     vk_check(vkCreatePipelineLayout(g.dev, &plci, NULL, &g.pl), "pipeline layout");
@@ -250,7 +257,7 @@ static void init_vkblas(void) {
     VkDescriptorSetLayoutCreateInfo tdslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 2, .pBindings = tbnds };
     vk_check(vkCreateDescriptorSetLayout(g.dev, &tdslci, NULL, &g.tdsl), "t dsl");
-    VkPushConstantRange tpcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 20 };
+    VkPushConstantRange tpcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 24 };
     VkPipelineLayoutCreateInfo tplci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &g.tdsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &tpcr };
     vk_check(vkCreatePipelineLayout(g.dev, &tplci, NULL, &g.tpl), "t pl");
@@ -324,6 +331,39 @@ static void init_vkblas(void) {
             vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &tp, NULL, &g.tpipe_h[d]), "ht pipe");
             vkDestroyShaderModule(g.dev, sm, NULL);
         }
+    }
+
+    // ---- split-k (llama.cpp 借鉴: K 分段并行 + reduce; 仅 fp32, 复用 g.dsl/g.pl) ----
+    static const char* sknames[4] = { "gemm_sk_nn.spv", "gemm_sk_nt.spv", "gemm_sk_tn.spv", "gemm_sk_tt.spv" };
+    static const char* sk128names[4] = { "gemm_sk128_nn.spv", "gemm_sk128_nt.spv", "gemm_sk128_tn.spv", "gemm_sk128_tt.spv" };
+    for (int i = 0; i < 4; i++) {
+        g.pipe_sk[i] = VK_NULL_HANDLE;
+        g.pipe_sk128[i] = VK_NULL_HANDLE;
+        if (load_spv(sknames[i], &sm) == 0) {
+            VkComputePipelineCreateInfo sp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                           VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                .layout = g.pl };
+            vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &sp, NULL, &g.pipe_sk[i]), "sk pipe");
+            vkDestroyShaderModule(g.dev, sm, NULL);
+        }
+        if (load_spv(sk128names[i], &sm) == 0) {
+            VkComputePipelineCreateInfo sp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                           VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                .layout = g.pl };
+            vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &sp, NULL, &g.pipe_sk128[i]), "sk128 pipe");
+            vkDestroyShaderModule(g.dev, sm, NULL);
+        }
+    }
+    g.sk_reduce_pipe = VK_NULL_HANDLE;
+    if (load_spv("split_k_reduce.spv", &sm) == 0) {
+        VkComputePipelineCreateInfo rp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+            .layout = g.tpl };
+        vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &rp, NULL, &g.sk_reduce_pipe), "sk reduce pipe");
+        vkDestroyShaderModule(g.dev, sm, NULL);
     }
 
     // ---- complex64: cvt_cx pipeline (3 storage buffer + 20B push) ----
@@ -889,6 +929,109 @@ static int run_gemm_vk128(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size
     return 0;
 }
 
+// split-k GEMM 提交 (llama.cpp 借鉴): K 切 split_k 段并行 (dispatch x = Mt×split_k),
+// 各段写 Sk[ik*M*N + m*N+n] (紧密 fp32), 再 reduce 归约到 C (alpha/beta 在 reduce 处理)
+// use128: 1 = v7-128 tile (Mt = ceil(M/128)), 0 = v6 (Mt = ceil(M/64))
+static int run_gemm_sk(int use128, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                       VkBuffer bC, size_t bc,
+                       uint32_t M, uint32_t N, uint32_t K,
+                       uint32_t lda, uint32_t ldb, uint32_t ldc,
+                       float alpha, float beta, uint32_t split_k) {
+    VkPipeline pipe = use128 ? g.pipe_sk128[variant] : g.pipe_sk[variant];
+    if (pipe == VK_NULL_HANDLE || g.sk_reduce_pipe == VK_NULL_HANDLE) return -1;
+
+    // Sk buffer: [split_k][M][N] 紧密 fp32 (grow-only, device-local)
+    size_t need = (size_t)split_k * M * N * 4;
+    if (g.sk_buf == VK_NULL_HANDLE || need > g.sk_buf_size) {
+        if (g.sk_buf != VK_NULL_HANDLE) {
+            vkFreeMemory(g.dev, g.sk_mem, NULL);
+            vkDestroyBuffer(g.dev, g.sk_buf, NULL);
+        }
+        VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = need, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        if (vkCreateBuffer(g.dev, &bci, NULL, &g.sk_buf) != VK_SUCCESS) return -1;
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(g.dev, g.sk_buf, &mr);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mr.size };
+        VkPhysicalDeviceMemoryProperties mprops;
+        vkGetPhysicalDeviceMemoryProperties(g.phys, &mprops);
+        for (uint32_t t = 0; t < mprops.memoryTypeCount; t++) {
+            if (mr.memoryTypeBits & (1u << t) &&
+                (mprops.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                mai.memoryTypeIndex = t; break;
+            }
+        }
+        if (vkAllocateMemory(g.dev, &mai, NULL, &g.sk_mem) != VK_SUCCESS) return -1;
+        if (vkBindBufferMemory(g.dev, g.sk_buf, g.sk_mem, 0) != VK_SUCCESS) return -1;
+        g.sk_buf_size = need;
+    }
+
+    uint32_t Mt = use128 ? (M + 127) / 128 : (M + 63) / 64;
+    uint32_t Nt = use128 ? (N + 127) / 128 : (N + 63) / 64;
+    uint32_t Kt = use128 ? (K + 15) / 16 : (K + 31) / 32;
+    uint32_t k_split = split_k;
+
+    // ---- pass 1: 分段 GEMM → Sk ----
+    {
+        VkDescriptorBufferInfo db[3] = { {bA, 0, ba}, {bB, 0, bb}, {g.sk_buf, 0, need} };
+        VkWriteDescriptorSet wds[3];
+        for (int i = 0; i < 3; i++) {
+            wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+        }
+        vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+        struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; uint32_t k_split; } pc = {
+            M, N, K, Mt, Nt, Kt, lda, ldb, ldc, alpha, beta, k_split };
+
+        vkResetCommandBuffer(g.cmd, 0);
+        VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(g.cmd, &cbbi);
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+        vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g.cmd, Mt * k_split, Nt, 1);
+        vkEndCommandBuffer(g.cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+        vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "sk submit");
+        vkQueueWaitIdle(g.queue);
+    }
+
+    // ---- pass 2: reduce Sk → C (alpha/beta) ----
+    {
+        VkDescriptorBufferInfo db[2] = { {g.sk_buf, 0, need}, {bC, 0, bc} };
+        VkWriteDescriptorSet wds[2];
+        for (int i = 0; i < 2; i++) {
+            wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = g.tdset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+        }
+        vkUpdateDescriptorSets(g.dev, 2, wds, 0, NULL);
+
+        struct { uint32_t ne, k_num, N, ldc; float alpha, beta; } pc2 = {
+            M * N, k_split, N, ldc, alpha, beta };
+
+        vkResetCommandBuffer(g.cmd, 0);
+        VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(g.cmd, &cbbi);
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.sk_reduce_pipe);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.tdset, 0, NULL);
+        vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+        uint32_t ne_align = (M * N + 255) / 256;
+        vkCmdDispatch(g.cmd, ne_align, 1, 1);
+        vkEndCommandBuffer(g.cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+        vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "sk reduce");
+        vkQueueWaitIdle(g.queue);
+    }
+    return 0;
+}
+
 static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, void* C,
                     size_t ba, size_t bb, size_t bc,
                     uint32_t M, uint32_t N, uint32_t K,
@@ -917,11 +1060,29 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
 
     // VKBLAS_TILE128=1: fp32 GEMM 走 v7-128 tile (llama l_warptile 移植, 实验对比)
     // 128×128 tile 在 M,N≥256 时快 5-36%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度
-    int rc;
-    if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256)
-        rc = run_gemm_vk128(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
-    else
-        rc = run_gemm_vk(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
+    int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+
+    // split-k (llama.cpp 借鉴): k≥2048 且 M×N tile 数 ≤ CU/2 (gfx803=36 CU → 18) 时,
+    // K 切 split_k = min(36/tiles, 8) 段并行, 补足 wave 占用 (仅 fp32, 直通 f16/bf16 不做)
+    int rc = -1;
+    uint32_t Mt = use128 ? (M + 127) / 128 : (M + 63) / 64;
+    uint32_t Nt = use128 ? (N + 127) / 128 : (N + 63) / 64;
+    if (K >= 2048 && Mt * Nt <= 18 && (use128 ? g.pipe_sk128[0] : g.pipe_sk[0]) != VK_NULL_HANDLE &&
+        getenv("VKBLAS_NOSPLITK") == NULL) {
+        uint32_t split_k = 36 / (Mt * Nt);
+        if (split_k > 8) split_k = 8;
+        if (split_k > 1) {
+            // 保证每段非空: k_split = ceil(K/split_k) → k_split*(split_k-1) < K 恒真
+            rc = run_gemm_sk(use128, variant, bA, ba, bB, bb, bC, bc,
+                             M, N, K, lda, ldb, ldc, alpha, beta, split_k);
+        }
+    }
+    if (rc != 0) {
+        if (use128)
+            rc = run_gemm_vk128(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
+        else
+            rc = run_gemm_vk(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
+    }
 
     release_ptr(mA, bA);
     if (bB_imported) release_ptr(mB, bB);
