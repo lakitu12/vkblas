@@ -1,0 +1,83 @@
+#version 450
+// cvt: bf16 <-> fp32 元素转换, 布局不变 (行步长不变, 元素单位)
+// 用于 bf16 GEMM 回退: A/B/C 先转 fp32 走引擎, 结果转回 bf16
+// 变体: -DCVT_B2F=1 → bf16→fp32; =0 → fp32→bf16 (RNE 舍入)
+//        -DCVT_TSP=1 → 转置输出 (仅 b2f): Out[c*ldout + r], 用于 B 的 NN 快路径
+//        -DCVT_ATOMIC=1 → f2b 原子逐元素写 (ldout 奇数回退); 默认列对直接写
+// In (R×C, 行步长 ldin) → Out (R×C, 行步长 ldout)
+//   bf16→fp32: 每线程 2 元素 (读 1 uint=2 bf16, 写 2 fp32, 无原子)
+//   fp32→bf16: 每线程 1 列对 (读 2 fp32, 写 1 uint=2 bf16, 无原子; 要求 ldout 偶)
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer In_buf  { uint In[];  };   // 位模式数组
+layout(set = 0, binding = 1) buffer Out_buf { uint Out[]; };
+layout(push_constant) uniform Params {
+    uint R, C;      // 有效行列 (总尺寸)
+    uint ldin;      // 输入行步长 (元素)
+    uint ldout;     // 输出行步长 (元素)
+    uint roff;      // 本 dispatch 的行偏移 (分块)
+} p;
+
+void main() {
+#if CVT_B2F
+    // 每线程 2 元素: 线性元素对 (e0, e0+1), e0 = 2*gid (跨行安全)
+    // 半字位置由内存索引 pos = r*ldin+c 的奇偶决定 (ldin 任意)
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.R * p.C;
+    uint e0 = gid * 2u;
+    if (e0 >= total) return;
+    uint r0 = p.roff + e0 / p.C;
+    uint c0 = e0 % p.C;
+    uint pos0 = r0 * p.ldin + c0;
+    uint w = In[pos0 >> 1];
+    uint bf0 = (w >> ((pos0 & 1u) * 16u)) & 0xFFFFu;
+#if CVT_TSP
+    Out[c0 * p.ldout + r0] = bf0 << 16u;
+#else
+    Out[r0 * p.ldout + c0] = bf0 << 16u;
+#endif
+    uint e1 = e0 + 1u;
+    if (e1 < total) {
+        uint r1 = p.roff + e1 / p.C;
+        uint c1 = e1 % p.C;
+        uint pos1 = r1 * p.ldin + c1;
+        uint w1 = In[pos1 >> 1];
+        uint bf1 = (w1 >> ((pos1 & 1u) * 16u)) & 0xFFFFu;
+#if CVT_TSP
+        Out[c1 * p.ldout + r1] = bf1 << 16u;
+#else
+        Out[r1 * p.ldout + c1] = bf1 << 16u;
+#endif
+    }
+#else
+#if CVT_ATOMIC
+    // 原子逐元素 (ldout 奇数时行内 uint 错位, 只能逐元素原子写)
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.R * p.C) return;
+    uint r = p.roff + gid / p.C;
+    uint c = gid % p.C;
+    uint i0 = r * p.ldin + c;
+    uint u0 = In[i0];
+    uint b0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;   // RNE → bf16
+    uint pos = r * p.ldout + c;
+    uint shift = (pos & 1u) * 16u;
+    atomicOr(Out[pos >> 1], (b0 & 0xFFFFu) << shift);
+#else
+    // 列对直接写: 每线程处理 (r, c0=2k, c0+1), 写 1 个 uint
+    // 要求 ldout 偶数 (行首 uint 对齐); host 侧检查, 奇数走 ATOMIC 变体
+    uint gid = gl_GlobalInvocationID.x;
+    uint cpairs = (p.C + 1u) / 2u;
+    if (gid >= p.R * cpairs) return;
+    uint r = p.roff + gid / cpairs;
+    uint c0 = (gid % cpairs) * 2u;
+    uint i0 = r * p.ldin + c0;
+    uint u0 = In[i0];
+    uint b0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;
+    uint b1 = 0u;
+    if (c0 + 1u < p.C) {
+        uint u1 = In[i0 + 1u];
+        b1 = (u1 + 0x7FFFu + ((u1 >> 16) & 1u)) >> 16;
+    }
+    Out[(r * p.ldout + c0) >> 1] = (b0 & 0xFFFFu) | ((b1 & 0xFFFFu) << 16u);
+#endif
+#endif
+}

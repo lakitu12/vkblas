@@ -161,6 +161,65 @@ static int is_fp32_ex(hipDataType t, hipblasComputeType_t c) {
     return (t == HIP_R_32F) &&
            (c == HIPBLAS_COMPUTE_32F || c == HIPBLAS_COMPUTE_32F_PEDANTIC);
 }
+static int is_bf16_ex(hipDataType t) { return t == HIP_R_16BF; }
+
+// ---------- bf16 GEMM 回退 (Vulkan) ----------
+// 与 vk_gemm_f32 相同的 column-major → row-major 翻译; A/B/C 为 bf16
+static hipblasStatus_t vk_gemm_bf16(hipblasHandle_t handle,
+                                    hipblasOperation_t transA, hipblasOperation_t transB,
+                                    int m, int n, int k,
+                                    const void* alpha, const void* AP, int lda,
+                                    const void* BP, int ldb,
+                                    const void* beta, void* CP, int ldc) {
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    float a, b;
+    if (get_scalar_f32(alpha, &a) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (get_scalar_f32(beta, &b) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vk] gemm bf16 %s%s m=%d n=%d k=%d lda=%d ldb=%d\n",
+                transA == HIPBLAS_OP_T ? "T" : "N", transB == HIPBLAS_OP_T ? "T" : "N",
+                m, n, k, lda, ldb);
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st = vkblas_gemm_bf16(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        a, BP, (uint32_t)ldb, AP, (uint32_t)lda, b, CP, (uint32_t)ldc,
+        1, 0, 0, 0);
+    if (st != VKBLAS_OK) {  // init/cvt 失败 → 转发真库
+        return FWD(hipblasGemmEx_v2, handle, transA, transB, m, n, k, alpha, AP,
+                   HIP_R_16BF, lda, BP, HIP_R_16BF, ldb, beta, CP, HIP_R_16BF, ldc,
+                   HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
+static hipblasStatus_t vk_gemm_strided_bf16(hipblasHandle_t handle,
+                                            hipblasOperation_t transA, hipblasOperation_t transB,
+                                            int m, int n, int k,
+                                            const void* alpha, const void* AP, int lda, long long strideA,
+                                            const void* BP, int ldb, long long strideB,
+                                            const void* beta, void* CP, int ldc, long long strideC,
+                                            int batchCount) {
+    if (m <= 0 || n <= 0 || k <= 0 || batchCount <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    float a, b;
+    if (get_scalar_f32(alpha, &a) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (get_scalar_f32(beta, &b) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st = vkblas_gemm_bf16(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        a, BP, (uint32_t)ldb, AP, (uint32_t)lda, b, CP, (uint32_t)ldc,
+        (uint32_t)batchCount, strideB, strideA, strideC);
+    if (st != VKBLAS_OK) {
+        return FWD(hipblasGemmStridedBatchedEx_v2, handle, transA, transB, m, n, k,
+                   alpha, AP, HIP_R_16BF, lda, strideA, BP, HIP_R_16BF, ldb, strideB,
+                   beta, CP, HIP_R_16BF, ldc, strideC, batchCount,
+                   HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
 
 // ---------- GEMM 族 ----------
 hipblasStatus_t hipblasSgemm(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
@@ -184,6 +243,8 @@ hipblasStatus_t hipblasGemmEx_v2(hipblasHandle_t handle, hipblasOperation_t tran
     if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
     if (is_fp32_ex(aType, computeType) && is_fp32_ex(bType, computeType) && cType == HIP_R_32F)
         return vk_gemm_f32(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+    if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
+        return vk_gemm_bf16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     return FWD(hipblasGemmEx_v2, handle, transA, transB, m, n, k, alpha, A, aType, lda,
                B, bType, ldb, beta, C, cType, ldc, computeType, algo);
 }
@@ -198,6 +259,9 @@ hipblasStatus_t hipblasGemmStridedBatchedEx_v2(hipblasHandle_t handle,
     if (is_fp32_ex(aType, computeType) && is_fp32_ex(bType, computeType) && cType == HIP_R_32F)
         return vk_gemm_strided_f32(handle, transA, transB, m, n, k, alpha, A, lda, strideA,
                                    B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+    if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
+        return vk_gemm_strided_bf16(handle, transA, transB, m, n, k, alpha, A, lda, strideA,
+                                    B, ldb, strideB, beta, C, ldc, strideC, batchCount);
     return FWD(hipblasGemmStridedBatchedEx_v2, handle, transA, transB, m, n, k, alpha, A, aType,
                lda, strideA, B, bType, ldb, strideB, beta, C, cType, ldc, strideC, batchCount,
                computeType, algo);
@@ -207,6 +271,9 @@ hipblasStatus_t hipblasGemmEx(hipblasHandle_t handle, hipblasOperation_t transA,
                               int lda, const void* B, hipblasDatatype_t bType, int ldb, const void* beta,
                               void* C, hipblasDatatype_t cType, int ldc, hipblasDatatype_t computeType,
                               hipblasGemmAlgo_t algo) {
+    if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
+        return vk_gemm_bf16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     return FWD(hipblasGemmEx, handle, transA, transB, m, n, k, alpha, A, aType, lda,
                B, bType, ldb, beta, C, cType, ldc, computeType, algo);
 }

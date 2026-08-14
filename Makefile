@@ -7,7 +7,9 @@ SHADER_DIR = src/shaders
 
 SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm_nt.spv $(SHADER_DIR)/gemm_tt.spv \
-          $(SHADER_DIR)/transpose.spv
+          $(SHADER_DIR)/transpose.spv \
+          $(SHADER_DIR)/cvt_b2f.spv $(SHADER_DIR)/cvt_b2f_tsp.spv \
+          $(SHADER_DIR)/cvt_f2b.spv $(SHADER_DIR)/cvt_f2b_atomic.spv
 
 all: libvkblas_hipblas.so test/test_gemm
 
@@ -22,6 +24,14 @@ $(SHADER_DIR)/gemm_tt.spv: $(SHADER_DIR)/gemm_tmpl.comp
 	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/transpose.spv: $(SHADER_DIR)/transpose.comp
 	glslangValidator -V $< -o $@
+$(SHADER_DIR)/cvt_b2f.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_B2F=1 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
+$(SHADER_DIR)/cvt_b2f_tsp.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_B2F=1 -DCVT_TSP=1 -DCVT_ATOMIC=0 $< -o $@
+$(SHADER_DIR)/cvt_f2b.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_B2F=0 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
+$(SHADER_DIR)/cvt_f2b_atomic.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_B2F=0 -DCVT_TSP=0 -DCVT_ATOMIC=1 $< -o $@
 
 # --- LD_PRELOAD 兼容层 ---
 libvkblas_hipblas.so: src/vkblas.c src/vkblas_hipblas.c src/vkblas.h $(SHADERS)

@@ -28,3 +28,17 @@ vkblas_status_t vkblas_gemm_f32(
     void* C, uint32_t ldc,
     uint32_t batch,
     int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
+// bf16 GEMM: 语义同 f32, 但 A/B/C 为 bf16 (2B/元素)
+// 内部: bf16 → fp32 (cvt shader) → fp32 GEMM → fp32 → bf16 回写
+// 所有 stride/ld 均为元素单位
+vkblas_status_t vkblas_gemm_bf16(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);
