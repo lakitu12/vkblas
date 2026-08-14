@@ -48,8 +48,8 @@ static struct {
 
     // bf16 回退: cvt pipeline (复用 tpl 布局: 2 storage buffer + 20B push)
     // 0 = bf16→fp32, 1 = bf16→fp32转置, 2 = fp32→bf16 (ldout 偶, 列对), 3 = fp32→bf16 (原子)
-    VkPipeline cpipe[4];
-    VkDescriptorSet cdset[4];
+    VkPipeline cpipe[8];
+    VkDescriptorSet cdset[8];
     // complex64 回退: cvt_cx (3-binding layout) + cx_combine (4-binding layout)
     VkDescriptorSetLayout cxl;      // 3 storage (In, OutR, OutI / InR, InI, Out)
     VkPipelineLayout cxpl;
@@ -216,9 +216,9 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
 
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 30 };  // GEMM 3+转置 2+cvt 4×2+cx 2×3+cmb 4+cz 3+cm64 4
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40 };  // GEMM 3+转置 2+cvt 4×2+fp16 cvt 3×2+cx 2×3+cmb 4+cz 3+cm64 4
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 11, .poolSizeCount = 1, .pPoolSizes = &ps };
+        .maxSets = 15, .poolSizeCount = 1, .pPoolSizes = &ps };
     vk_check(vkCreateDescriptorPool(g.dev, &dpci, NULL, &g.dpool), "desc pool");
     VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
@@ -250,9 +250,12 @@ static void init_vkblas(void) {
 
     // ---- cvt pipeline (复用 tdsl/tpl: 2 storage buffer + 20B push) ----
     // 0 = bf16→fp32, 1 = bf16→fp32 转置输出 (B 快路径), 2 = fp32→bf16 列对, 3 = fp32→bf16 原子
-    static const char* cnames[4] = { "cvt_b2f.spv", "cvt_b2f_tsp.spv", "cvt_f2b.spv", "cvt_f2b_atomic.spv" };
-    for (int i = 0; i < 4; i++) {
-        if (load_spv(cnames[i], &sm) != 0) continue;  // 缺 shader 则 bf16 回退不可用
+    // 4 = fp16→fp32, 5 = (预留), 6 = fp32→fp16 列对, 7 = fp32→fp16 原子
+    static const char* cnames[8] = { "cvt_b2f.spv", "cvt_b2f_tsp.spv", "cvt_f2b.spv", "cvt_f2b_atomic.spv",
+                                     "cvt_h2f.spv", NULL, "cvt_f2h.spv", "cvt_f2h_atomic.spv" };
+    for (int i = 0; i < 8; i++) {
+        if (cnames[i] == NULL) continue;
+        if (load_spv(cnames[i], &sm) != 0) continue;  // 缺 shader 则对应回退不可用
         VkComputePipelineCreateInfo ccp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
                        VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
@@ -397,7 +400,8 @@ static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
     VkExternalMemoryBufferCreateInfo embci = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .pNext = &embci, .size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .pNext = &embci, .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     if (vkCreateBuffer(g.dev, &bci, NULL, &b) != VK_SUCCESS) { close(fd); return -1; }
 
@@ -664,12 +668,28 @@ static int cvt_run(int pipe, VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(g.cmd, &cbbi);
-    if (pipe == 3) {
-        // f2b 原子 OR 需要输出清零 (只清 C 区域, 不越界)
-        vkCmdFillBuffer(g.cmd, bOut, 0, bytes_out, 0u);
-    }
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.cpipe[pipe]);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.cdset[pipe], 0, NULL);
+    if (pipe == 3 || pipe == 7) {
+        // 线性 uint 对模式 (f2b/f2h 奇数 ldout): total = (R-1)*ldout+C 半字,
+        // 每线程 2 个连续半字写 1 uint (非原子, 跨行安全, 无需前置清零)
+        uint32_t total = (R - 1u) * ldout + C;
+        uint32_t npairs = (total + 1u) / 2u;
+        uint32_t pairs_per = (8u * 1024 * 1024) / 8u;   // 8MB / 8B 每对
+        if (pairs_per > (1u << 20)) pairs_per = (1u << 20);
+        for (uint32_t ro = 0; ro < npairs; ro += pairs_per) {
+            pc.roff = ro;
+            uint32_t np = npairs - ro < pairs_per ? npairs - ro : pairs_per;
+            vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(g.cmd, (np + 255) / 256, 1, 1);
+        }
+        vkEndCommandBuffer(g.cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+        vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "cvt submit");
+        vkQueueWaitIdle(g.queue);
+        return 0;
+    }
     // 每块最多 ~2M 元素 (8MB/4B), 按行切
     uint32_t rows_per = (8u * 1024 * 1024) / (C * 4u);
     if (rows_per < 32) rows_per = 32;
@@ -841,12 +861,119 @@ vkblas_status_t vkblas_gemm_bf16(
                          bb2_used, g.ibuf[2], bc2,
                          M, N, K, lda, ldb_eff, ldc, alpha, beta);
         uint64_t t4 = trace ? now_us() : 0;
-        // 回写: fp32 → bf16 (ldc 偶数走列对快路径, 奇数走原子变体)
+        // 回写: fp32 → bf16 (ldc 偶数走列对快路径, 奇数走原子变体; 原子路径由 cvt_run 内部先清零)
         if (rc == 0)
             rc = cvt_run((ldc & 1) ? 3 : 2, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc);
         uint64_t t5 = trace ? now_us() : 0;
         if (trace)
             fprintf(stderr, "[vk] bf16: import %lu cvtA %lu cvtB %lu bTsp %lu cvtC %lu gemm %lu f2b %lu us (total %lu)\n",
+                    (unsigned long)(t1 - t0), (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                    (unsigned long)(t3 - t2), (unsigned long)(t3b - t3),
+                    (unsigned long)(t4 - t3b), (unsigned long)(t5 - t4),
+                    (unsigned long)(t5 - t0));
+        release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+        if (rc != 0) { pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
+
+        pa += stride_a * 2; pb += stride_b * 2; pc += stride_c * 2;
+    }
+    pthread_mutex_unlock(&g.lock);
+    return VKBLAS_OK;
+}
+
+// fp16 GEMM 回退: A/B/C (fp16, 2B/元素) → 内部 fp32 → fp32 GEMM → 回写 fp16
+// 管道同 bf16 (cvt 索引 4/6/7), 位转换不同: unpackHalf2x16/packHalf2x16 (RNE)
+// op_b==N 时 cvt 后单独转置 (transpose.comp 快路径) 走 TB=1
+vkblas_status_t vkblas_gemm_f16(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    if (M == 0 || N == 0 || K == 0 || batch == 0) return VKBLAS_ERR_PARAM;
+    pthread_mutex_lock(&g.lock);
+    ensure_init();
+    if (!g.ready || g.cpipe[4] == VK_NULL_HANDLE) {
+        pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_INIT;
+    }
+
+    // 有效区域与字节数 (元素单位)
+    uint32_t Ra = (op_a == VKBLAS_OP_T) ? K : M;          // A 行数
+    uint32_t Ca = (op_a == VKBLAS_OP_T) ? M : K;          // A 每行有效元素
+    size_t ba_e = (size_t)(Ra - 1) * lda + Ca;            // A 元素数
+    size_t ba2  = ba_e * 4;                               // A2 fp32 字节
+    size_t bb_e, bb2;
+    uint32_t Rb, Cb;
+    int variant;
+    if (op_b == VKBLAS_OP_N) {
+        // B 转置在 fp32 化后单独做 (transpose.comp 快路径)
+        Rb = K; Cb = N;
+        bb_e = (size_t)(K - 1) * ldb + N;
+        bb2  = bb_e * 4;
+        variant = (int)op_a * 2 + 1;                      // TB=1 (转置后)
+    } else {
+        Rb = N; Cb = K;
+        bb_e = (size_t)(N - 1) * ldb + K;
+        bb2  = bb_e * 4;
+        variant = (int)op_a * 2 + (int)op_b;
+    }
+    size_t bc_e = (size_t)(M - 1) * ldc + N;
+    size_t bc2  = bc_e * 4;
+
+    if (ensure_ibuf(0, ba2) != 0 || ensure_ibuf(1, bb2) != 0 || ensure_ibuf(2, bc2) != 0) {
+        pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT;
+    }
+
+    const char* pa = (const char*)A, *pb = (const char*)B, *pc = (const char*)C;
+    int trace = getenv("VKBLAS_TRACE") != NULL;
+    for (uint32_t i = 0; i < batch; i++) {
+        // import fp16 输入
+        uint64_t t0 = trace ? now_us() : 0;
+        VkBuffer bA, bB, bC; VkDeviceMemory mA, mB, mC; VkDeviceSize oA, oB, oC;
+        if (import_ptr(pa, ba_e * 2, &bA, &mA, &oA) != 0) { pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
+        if (import_ptr(pb, bb_e * 2, &bB, &mB, &oB) != 0) { release_ptr(mA, bA); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
+        if (import_ptr(pc, bc_e * 2, &bC, &mC, &oC) != 0) { release_ptr(mA, bA); release_ptr(mB, bB); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
+
+        // A: fp16 → fp32 (布局不变); B: fp16 → fp32, 若 op_b==N 再转置 (快路径)
+        int rc = 0;
+        rc |= cvt_run(4, bA, ba_e * 2, g.ibuf[0], ba2, Ra, Ca, lda, lda);
+        uint64_t t1 = trace ? now_us() : 0;
+        rc |= cvt_run(4, bB, bb_e * 2, g.ibuf[1], bb2, Rb, Cb, ldb, ldb);
+        uint64_t t2 = trace ? now_us() : 0;
+        VkBuffer bBt = VK_NULL_HANDLE;
+        uint32_t ldb_eff = ldb;
+        if (op_b == VKBLAS_OP_N) {
+            // ibuf[1] 是 (K×N, ldb) → 转置成 (N×K) 紧密, 走 TB=1
+            if (transpose_vk(g.ibuf[1], bb2, K, N, ldb, &bBt, &ldb_eff) != 0) rc = -1;
+        }
+        uint64_t t3 = trace ? now_us() : 0;
+        // C: beta!=0 时读入 fp32; beta==0 时 ibuf[2] 无需初始化 (GEMM 覆盖写)
+        if (beta != 0.0f)
+            rc |= cvt_run(4, bC, bc_e * 2, g.ibuf[2], bc2, M, N, ldc, ldc);
+        uint64_t t3b = trace ? now_us() : 0;
+        if (rc != 0) {
+            release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+            pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT;
+        }
+
+        // fp32 GEMM (A2/B2 内部, C2 内部; B 可能走转置快路径)
+        size_t bb2_used = bb2;
+        if (bBt != VK_NULL_HANDLE) {
+            bb2_used = (size_t)N * K * 4;   // 转置后 (N×K) 紧密
+        }
+        rc = run_gemm_vk(variant, g.ibuf[0], ba2, bBt != VK_NULL_HANDLE ? bBt : g.ibuf[1],
+                         bb2_used, g.ibuf[2], bc2,
+                         M, N, K, lda, ldb_eff, ldc, alpha, beta);
+        uint64_t t4 = trace ? now_us() : 0;
+        // 回写: fp32 → fp16 (ldc 偶数走列对快路径, 奇数走原子变体; 原子路径由 cvt_run 内部先清零)
+        if (rc == 0)
+            rc = cvt_run((ldc & 1) ? 7 : 6, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc);
+        uint64_t t5 = trace ? now_us() : 0;
+        if (trace)
+            fprintf(stderr, "[vk] f16: import %lu cvtA %lu cvtB %lu bTsp %lu cvtC %lu gemm %lu f2h %lu us (total %lu)\n",
                     (unsigned long)(t1 - t0), (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
                     (unsigned long)(t3 - t2), (unsigned long)(t3b - t3),
                     (unsigned long)(t4 - t3b), (unsigned long)(t5 - t4),

@@ -83,13 +83,13 @@ d = (out.cpu() - ref).abs().max().item()
 bad += 0 if d < 0.1 else 1
 print(f"  addmm 256: maxdiff={d:.2e} {'OK' if d < 0.1 else 'FAIL'}")
 
-# fp16 (应 fallback 到真 rocBLAS)
+# fp16 (vkblas 接管: PyTorch 走 hipblaslt_ext → gfx803 fallback 直连 rocblas_gemm_ex, 由 rocblas 层拦截)
 a16 = torch.randn(128, 128, device=dev, dtype=torch.float16)
 b16 = torch.randn(128, 128, device=dev, dtype=torch.float16)
 c16 = a16 @ b16
 torch.cuda.synchronize()
 d = (c16.cpu().float() - (a16.cpu().float() @ b16.cpu().float())).abs().max().item()
-print(f"  fp16 128: maxdiff={d:.2e} (fallback)")
+print(f"  fp16 128: maxdiff={d:.2e} (vkblas)")
 
 # complex128 (Zgemm 回退: 拆 4×fp64 GEMM; 注意 complex linear = x@w^T 不共轭!)
 for (m, n, k) in [(16, 16, 16), (33, 65, 17), (128, 256, 320), (512, 256, 768)]:

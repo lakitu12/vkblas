@@ -18,7 +18,47 @@ layout(push_constant) uniform Params {
 } p;
 
 void main() {
-#if CVT_B2F
+#if CVT_CLEAR
+    // 半字粒度清零 (atomicAnd 清目标半字, 不影响同 uint 另一半字)
+    // 供原子回写路径使用: 原子 OR 不能叠加旧值, 必须先清零
+    // 调用约定: R = 半字总数, C = 1 (单列), ldin/ldout 忽略
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.R * p.C) return;
+    uint pos = gid;
+    uint shift = (pos & 1u) * 16u;
+    atomicAnd(Out[pos >> 1], ~(0xFFFFu << shift));
+    return;
+#elif CVT_H2F
+    // fp16→fp32: 每线程 2 元素 (读 1 uint=2 fp16, 写 2 fp32, 无原子)
+    // unpackHalf2x16: 低 16 位→.x, 高 16 位→.y (RNE 语义由硬件转换保证)
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.R * p.C;
+    uint e0 = gid * 2u;
+    if (e0 >= total) return;
+    uint r0 = p.roff + e0 / p.C;
+    uint c0 = e0 % p.C;
+    uint pos0 = r0 * p.ldin + c0;
+    uint w = In[pos0 >> 1];
+    vec2 h0 = unpackHalf2x16(w >> ((pos0 & 1u) * 16u));
+#if CVT_TSP
+    Out[c0 * p.ldout + r0] = floatBitsToUint(h0.x);
+#else
+    Out[r0 * p.ldout + c0] = floatBitsToUint(h0.x);
+#endif
+    uint e1 = e0 + 1u;
+    if (e1 < total) {
+        uint r1 = p.roff + e1 / p.C;
+        uint c1 = e1 % p.C;
+        uint pos1 = r1 * p.ldin + c1;
+        uint w1 = In[pos1 >> 1];
+        vec2 h1 = unpackHalf2x16(w1 >> ((pos1 & 1u) * 16u));
+#if CVT_TSP
+        Out[c1 * p.ldout + r1] = floatBitsToUint(h1.x);
+#else
+        Out[r1 * p.ldout + c1] = floatBitsToUint(h1.x);
+#endif
+    }
+#elif CVT_B2F
     // 每线程 2 元素: 线性元素对 (e0, e0+1), e0 = 2*gid (跨行安全)
     // 半字位置由内存索引 pos = r*ldin+c 的奇偶决定 (ldin 任意)
     uint gid = gl_GlobalInvocationID.x;
@@ -49,18 +89,66 @@ void main() {
 #endif
     }
 #else
+#if CVT_F2H
+    // ---- fp32→fp16 (packHalf2x16, RNE) ----
 #if CVT_ATOMIC
-    // 原子逐元素 (ldout 奇数时行内 uint 错位, 只能逐元素原子写)
+    // 线性 uint 对 (非原子): 每线程 2 个连续半字, 跨行安全, 任意 ldout, 无需前置清零
+    // total = (R-1)*ldout + C 半字; roff = 对偏移; e0 恒偶 → 低半字, e1=e0+1 → 高半字
+    // (2026-08-14: 弃用原子逐元素 — gfx803/RADV 上原子 clear+OR 组合竞争丢写, 结果不稳定)
     uint gid = gl_GlobalInvocationID.x;
-    if (gid >= p.R * p.C) return;
-    uint r = p.roff + gid / p.C;
-    uint c = gid % p.C;
-    uint i0 = r * p.ldin + c;
-    uint u0 = In[i0];
+    uint total = (p.R - 1u) * p.ldout + p.C;
+    uint e0 = (p.roff + gid) * 2u;
+    if (e0 >= total) return;
+    uint r0 = e0 / p.ldout;
+    uint c0 = e0 % p.ldout;
+    float f0 = uintBitsToFloat(In[r0 * p.ldin + c0]);
+    uint h0 = packHalf2x16(vec2(f0, 0.0)) & 0xFFFFu;
+    uint u = h0;
+    uint e1 = e0 + 1u;
+    if (e1 < total) {
+        uint r1 = e1 / p.ldout;
+        uint c1 = e1 % p.ldout;
+        float f1 = uintBitsToFloat(In[r1 * p.ldin + c1]);
+        uint h1 = packHalf2x16(vec2(f1, 0.0)) & 0xFFFFu;
+        u |= h1 << 16u;
+    }
+    Out[e0 >> 1] = u;
+#else
+    // 列对直接写: 每线程处理 (r, c0=2k, c0+1), 写 1 个 uint
+    // 要求 ldout 偶数 (行首 uint 对齐); host 侧检查, 奇数走 ATOMIC 变体
+    uint gid = gl_GlobalInvocationID.x;
+    uint cpairs = (p.C + 1u) / 2u;
+    if (gid >= p.R * cpairs) return;
+    uint r = p.roff + gid / cpairs;
+    uint c0 = (gid % cpairs) * 2u;
+    uint i0 = r * p.ldin + c0;
+    float f0 = uintBitsToFloat(In[i0]);
+    float f1 = 0.0;
+    if (c0 + 1u < p.C) f1 = uintBitsToFloat(In[i0 + 1u]);
+    Out[(r * p.ldout + c0) >> 1] = packHalf2x16(vec2(f0, f1));
+#endif
+#else
+#if CVT_ATOMIC
+    // 线性 uint 对 (非原子): 每线程 2 个连续半字, 跨行安全, 任意 ldout, 无需前置清零
+    // (2026-08-14: 弃用原子逐元素 — gfx803/RADV 上原子 clear+OR 组合竞争丢写, 结果不稳定)
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = (p.R - 1u) * p.ldout + p.C;
+    uint e0 = (p.roff + gid) * 2u;
+    if (e0 >= total) return;
+    uint r0 = e0 / p.ldout;
+    uint c0 = e0 % p.ldout;
+    uint u0 = In[r0 * p.ldin + c0];
     uint b0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;   // RNE → bf16
-    uint pos = r * p.ldout + c;
-    uint shift = (pos & 1u) * 16u;
-    atomicOr(Out[pos >> 1], (b0 & 0xFFFFu) << shift);
+    uint u = b0 & 0xFFFFu;
+    uint e1 = e0 + 1u;
+    if (e1 < total) {
+        uint r1 = e1 / p.ldout;
+        uint c1 = e1 % p.ldout;
+        uint u1 = In[r1 * p.ldin + c1];
+        uint b1 = (u1 + 0x7FFFu + ((u1 >> 16) & 1u)) >> 16;
+        u |= (b1 & 0xFFFFu) << 16u;
+    }
+    Out[e0 >> 1] = u;
 #else
     // 列对直接写: 每线程处理 (r, c0=2k, c0+1), 写 1 个 uint
     // 要求 ldout 偶数 (行首 uint 对齐); host 侧检查, 奇数走 ATOMIC 变体
@@ -79,5 +167,6 @@ void main() {
     }
     Out[(r * p.ldout + c0) >> 1] = (b0 & 0xFFFFu) | ((b1 & 0xFFFFu) << 16u);
 #endif
-#endif
+#endif  // CVT_F2H
+#endif  // CVT_H2F / CVT_B2F
 }

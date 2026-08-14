@@ -10,6 +10,8 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/transpose.spv \
           $(SHADER_DIR)/cvt_b2f.spv $(SHADER_DIR)/cvt_b2f_tsp.spv \
           $(SHADER_DIR)/cvt_f2b.spv $(SHADER_DIR)/cvt_f2b_atomic.spv \
+          $(SHADER_DIR)/cvt_h2f.spv \
+          $(SHADER_DIR)/cvt_f2h.spv $(SHADER_DIR)/cvt_f2h_atomic.spv \
           $(SHADER_DIR)/cvt_cx_planar.spv $(SHADER_DIR)/cvt_cx_inter.spv \
           $(SHADER_DIR)/cx_combine.spv \
           $(SHADER_DIR)/gemm_d64_nn.spv $(SHADER_DIR)/gemm_d64_tn.spv \
@@ -38,6 +40,12 @@ $(SHADER_DIR)/cvt_f2b.spv: $(SHADER_DIR)/cvt_tmpl.comp
 	glslangValidator -V -DCVT_B2F=0 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
 $(SHADER_DIR)/cvt_f2b_atomic.spv: $(SHADER_DIR)/cvt_tmpl.comp
 	glslangValidator -V -DCVT_B2F=0 -DCVT_TSP=0 -DCVT_ATOMIC=1 $< -o $@
+$(SHADER_DIR)/cvt_h2f.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_H2F=1 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
+$(SHADER_DIR)/cvt_f2h.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_H2F=0 -DCVT_F2H=1 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
+$(SHADER_DIR)/cvt_f2h_atomic.spv: $(SHADER_DIR)/cvt_tmpl.comp
+	glslangValidator -V -DCVT_H2F=0 -DCVT_F2H=1 -DCVT_TSP=0 -DCVT_ATOMIC=1 $< -o $@
 $(SHADER_DIR)/cvt_cx_planar.spv: $(SHADER_DIR)/cvt_cx.comp
 	glslangValidator -V -DCX_PLANAR=1 $< -o $@
 $(SHADER_DIR)/cvt_cx_inter.spv: $(SHADER_DIR)/cvt_cx.comp

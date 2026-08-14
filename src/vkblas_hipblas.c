@@ -188,7 +188,9 @@ static int is_fp32_ex(hipDataType t, hipblasComputeType_t c) {
     return (t == HIP_R_32F) &&
            (c == HIPBLAS_COMPUTE_32F || c == HIPBLAS_COMPUTE_32F_PEDANTIC);
 }
-static int is_bf16_ex(hipDataType t) { return t == HIP_R_16BF; }
+// 通吃 HIPBLAS_V2 两种模式: HIP_R_16BF=14; legacy hipblasDatatype_t HIPBLAS_R_16B=168
+static int is_bf16_ex(hipDataType t) { return (int)t == HIP_R_16BF || (int)t == HIPBLAS_R_16B; }
+static int is_fp16_ex(hipDataType t) { return (int)t == HIP_R_16F || (int)t == HIPBLAS_R_16F; }
 
 // ---------- bf16 GEMM 回退 (Vulkan) ----------
 // 与 vk_gemm_f32 相同的 column-major → row-major 翻译; A/B/C 为 bf16
@@ -248,6 +250,64 @@ static hipblasStatus_t vk_gemm_strided_bf16(hipblasHandle_t handle,
     return HIPBLAS_STATUS_SUCCESS;
 }
 
+// ---------- fp16 GEMM 回退 (Vulkan) ----------
+// 同 bf16: A/B/C 为 fp16, 内部 fp32 引擎 + cvt (unpackHalf2x16/packHalf2x16)
+static hipblasStatus_t vk_gemm_f16(hipblasHandle_t handle,
+                                   hipblasOperation_t transA, hipblasOperation_t transB,
+                                   int m, int n, int k,
+                                   const void* alpha, const void* AP, int lda,
+                                   const void* BP, int ldb,
+                                   const void* beta, void* CP, int ldc) {
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    float a, b;
+    if (get_scalar_f32(alpha, &a) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (get_scalar_f32(beta, &b) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vk] gemm f16 %s%s m=%d n=%d k=%d lda=%d ldb=%d\n",
+                transA == HIPBLAS_OP_T ? "T" : "N", transB == HIPBLAS_OP_T ? "T" : "N",
+                m, n, k, lda, ldb);
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st = vkblas_gemm_f16(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        a, BP, (uint32_t)ldb, AP, (uint32_t)lda, b, CP, (uint32_t)ldc,
+        1, 0, 0, 0);
+    if (st != VKBLAS_OK) {  // init/cvt 失败 → 转发真库
+        return FWD(hipblasGemmEx_v2, handle, transA, transB, m, n, k, alpha, AP,
+                   HIP_R_16F, lda, BP, HIP_R_16F, ldb, beta, CP, HIP_R_16F, ldc,
+                   HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
+static hipblasStatus_t vk_gemm_strided_f16(hipblasHandle_t handle,
+                                           hipblasOperation_t transA, hipblasOperation_t transB,
+                                           int m, int n, int k,
+                                           const void* alpha, const void* AP, int lda, long long strideA,
+                                           const void* BP, int ldb, long long strideB,
+                                           const void* beta, void* CP, int ldc, long long strideC,
+                                           int batchCount) {
+    if (m <= 0 || n <= 0 || k <= 0 || batchCount <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    float a, b;
+    if (get_scalar_f32(alpha, &a) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (get_scalar_f32(beta, &b) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st = vkblas_gemm_f16(
+        transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
+        (uint32_t)n, (uint32_t)m, (uint32_t)k,
+        a, BP, (uint32_t)ldb, AP, (uint32_t)lda, b, CP, (uint32_t)ldc,
+        (uint32_t)batchCount, strideB, strideA, strideC);
+    if (st != VKBLAS_OK) {
+        return FWD(hipblasGemmStridedBatchedEx_v2, handle, transA, transB, m, n, k,
+                   alpha, AP, HIP_R_16F, lda, strideA, BP, HIP_R_16F, ldb, strideB,
+                   beta, CP, HIP_R_16F, ldc, strideC, batchCount,
+                   HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
 // ---------- GEMM 族 ----------
 hipblasStatus_t hipblasSgemm(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
                              int m, int n, int k, const float* alpha, const float* AP, int lda,
@@ -268,10 +328,13 @@ hipblasStatus_t hipblasGemmEx_v2(hipblasHandle_t handle, hipblasOperation_t tran
                                  const void* B, hipDataType bType, int ldb, const void* beta, void* C,
                                  hipDataType cType, int ldc, hipblasComputeType_t computeType, hipblasGemmAlgo_t algo) {
     if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
+    fprintf(stderr, "[dbg] hipblasGemmEx_v2 aType=%d\n", (int)aType);
     if (is_fp32_ex(aType, computeType) && is_fp32_ex(bType, computeType) && cType == HIP_R_32F)
         return vk_gemm_f32(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
         return vk_gemm_bf16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+    if (is_fp16_ex(aType) && is_fp16_ex(bType) && is_fp16_ex(cType))
+        return vk_gemm_f16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     return FWD(hipblasGemmEx_v2, handle, transA, transB, m, n, k, alpha, A, aType, lda,
                B, bType, ldb, beta, C, cType, ldc, computeType, algo);
 }
@@ -289,6 +352,9 @@ hipblasStatus_t hipblasGemmStridedBatchedEx_v2(hipblasHandle_t handle,
     if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
         return vk_gemm_strided_bf16(handle, transA, transB, m, n, k, alpha, A, lda, strideA,
                                     B, ldb, strideB, beta, C, ldc, strideC, batchCount);
+    if (is_fp16_ex(aType) && is_fp16_ex(bType) && is_fp16_ex(cType))
+        return vk_gemm_strided_f16(handle, transA, transB, m, n, k, alpha, A, lda, strideA,
+                                   B, ldb, strideB, beta, C, ldc, strideC, batchCount);
     return FWD(hipblasGemmStridedBatchedEx_v2, handle, transA, transB, m, n, k, alpha, A, aType,
                lda, strideA, B, bType, ldb, strideB, beta, C, cType, ldc, strideC, batchCount,
                computeType, algo);
@@ -301,6 +367,8 @@ hipblasStatus_t hipblasGemmEx(hipblasHandle_t handle, hipblasOperation_t transA,
     if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
     if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
         return vk_gemm_bf16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+    if (is_fp16_ex(aType) && is_fp16_ex(bType) && is_fp16_ex(cType))
+        return vk_gemm_f16(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     return FWD(hipblasGemmEx, handle, transA, transB, m, n, k, alpha, A, aType, lda,
                B, bType, ldb, beta, C, cType, ldc, computeType, algo);
 }
@@ -633,4 +701,159 @@ hipblasStatus_t hipblasZgetrsBatched_v2(hipblasHandle_t handle, const hipblasOpe
                                         hipDoubleComplex* const A[], const int lda, const int* ipiv,
                                         hipDoubleComplex* const B[], const int ldb, int* info, const int batchCount) {
     return FWD(hipblasZgetrsBatched_v2, handle, trans, n, nrhs, A, lda, ipiv, B, ldb, info, batchCount);
+}
+
+// ================= rocBLAS 层拦截 =================
+// 关键发现 (2026-08-14): PyTorch fp16 GEMM 走 hipblaslt_ext::Gemm (C++ API),
+// gfx803 上 hipblasLt 不支持 → 内部直接 fallback 调 rocblas_gemm_ex,
+// 完全绕过 hipBLAS C 符号层 → LD_PRELOAD 劫持 hipblas 符号对 fp16 无效!
+// 在此层拦截 fp16/bf16/fp32 GEMM, 其余转发真 librocblas。
+// 与 hipblas 层的关系: hipblas 层失败转发的调用会再次进入本层并再次尝试,
+// 最终 FWD 到真库, 无递归风险 (本层 FWD 用 RTLD 句柄直取真库指针)。
+#include <rocblas/rocblas.h>
+
+static void* real_rocblas(void) {
+    static void* h = NULL;
+    if (!h) {
+        h = dlopen("librocblas.so.4", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("/opt/rocm/lib/librocblas.so.4", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) fprintf(stderr, "[vkblas] real librocblas.so.4 not found: %s\n", dlerror());
+    }
+    return h;
+}
+static void* rcb_sym(const char* name) { return real_rocblas() ? dlsym(real_rocblas(), name) : NULL; }
+#define FWD_RC(name, ...) __extension__ ({                             \
+    static __typeof__(&name) fn = NULL;                                \
+    if (!fn) fn = (__typeof__(&name))rcb_sym(#name);                   \
+    fn ? fn(__VA_ARGS__) : rocblas_status_not_implemented; })
+
+// 共用 GEMM 翻译: 与 hipblas 层完全相同 (column-major → row-major 交叉)
+// op_a=transB, op_b=transA, M=n, N=m, A 指针=b, B 指针=a, lda=ldb, ldb=lda
+rocblas_status rocblas_gemm_ex(rocblas_handle handle, rocblas_operation transA, rocblas_operation transB,
+                               rocblas_int m, rocblas_int n, rocblas_int k, const void* alpha,
+                               const void* a, rocblas_datatype a_type, rocblas_int lda,
+                               const void* b, rocblas_datatype b_type, rocblas_int ldb, const void* beta,
+                               const void* c, rocblas_datatype c_type, rocblas_int ldc,
+                               void* d, rocblas_datatype d_type, rocblas_int ldd,
+                               rocblas_datatype compute_type, rocblas_gemm_algo algo,
+                               int32_t solution_index, uint32_t flags) {
+    if (!handle) return rocblas_status_invalid_value;
+    if (m <= 0 || n <= 0 || k <= 0) return rocblas_status_invalid_value;
+    // 仅支持 in-place (c==d) + fp32 compute; 其余转发
+    // 注意: gemm_ex 的 compute_type 用 rocblas_datatype 枚举 (f32_r=151), 不是 rocblas_compute_type (300+)!
+    if (c != d || ldc != ldd || compute_type != rocblas_datatype_f32_r)
+        return FWD_RC(rocblas_gemm_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, b, b_type, ldb, beta, c, c_type, ldc,
+                      d, d_type, ldd, compute_type, algo, solution_index, flags);
+    float av, bv;
+    if (get_scalar_f32(alpha, &av) != 0 || get_scalar_f32(beta, &bv) != 0)
+        return FWD_RC(rocblas_gemm_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, b, b_type, ldb, beta, c, c_type, ldc,
+                      d, d_type, ldd, compute_type, algo, solution_index, flags);
+    int is_f16 = a_type == rocblas_datatype_f16_r && b_type == rocblas_datatype_f16_r
+                 && c_type == rocblas_datatype_f16_r && d_type == rocblas_datatype_f16_r;
+    int is_bf16 = a_type == rocblas_datatype_bf16_r && b_type == rocblas_datatype_bf16_r
+                  && c_type == rocblas_datatype_bf16_r && d_type == rocblas_datatype_bf16_r;
+    int is_f32 = a_type == rocblas_datatype_f32_r && b_type == rocblas_datatype_f32_r
+                 && c_type == rocblas_datatype_f32_r && d_type == rocblas_datatype_f32_r;
+    if (!is_f16 && !is_bf16 && !is_f32)
+        return FWD_RC(rocblas_gemm_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, b, b_type, ldb, beta, c, c_type, ldc,
+                      d, d_type, ldd, compute_type, algo, solution_index, flags);
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vk] rocblas_gemm_ex %s %s %s m=%d n=%d k=%d\n",
+                is_f16 ? "f16" : is_bf16 ? "bf16" : "f32",
+                transA == rocblas_operation_transpose ? "T" : "N",
+                transB == rocblas_operation_transpose ? "T" : "N", m, n, k);
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st;
+    if (is_f16)
+        st = vkblas_gemm_f16(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            1, 0, 0, 0);
+    else if (is_bf16)
+        st = vkblas_gemm_bf16(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            1, 0, 0, 0);
+    else
+        st = vkblas_gemm_f32(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            1, 0, 0, 0);
+    if (st == VKBLAS_OK) return rocblas_status_success;
+    return FWD_RC(rocblas_gemm_ex, handle, transA, transB, m, n, k, alpha,
+                  a, a_type, lda, b, b_type, ldb, beta, c, c_type, ldc,
+                  d, d_type, ldd, compute_type, algo, solution_index, flags);
+}
+
+rocblas_status rocblas_gemm_strided_batched_ex(rocblas_handle handle, rocblas_operation transA, rocblas_operation transB,
+                                               rocblas_int m, rocblas_int n, rocblas_int k, const void* alpha,
+                                               const void* a, rocblas_datatype a_type, rocblas_int lda, int64_t strideA,
+                                               const void* b, rocblas_datatype b_type, rocblas_int ldb, int64_t strideB,
+                                               const void* beta, const void* c, rocblas_datatype c_type, rocblas_int ldc, int64_t strideC,
+                                               void* d, rocblas_datatype d_type, rocblas_int ldd, int64_t strideD,
+                                               rocblas_int batch_count, rocblas_datatype compute_type,
+                                               rocblas_gemm_algo algo, int32_t solution_index, uint32_t flags) {
+    if (!handle) return rocblas_status_invalid_value;
+    if (m <= 0 || n <= 0 || k <= 0 || batch_count <= 0) return rocblas_status_invalid_value;
+    // compute_type 用 rocblas_datatype 枚举 (f32_r=151)
+    if (c != d || ldc != ldd || compute_type != rocblas_datatype_f32_r)
+        return FWD_RC(rocblas_gemm_strided_batched_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, strideA, b, b_type, ldb, strideB, beta, c, c_type, ldc, strideC,
+                      d, d_type, ldd, strideD, batch_count, compute_type, algo, solution_index, flags);
+    float av, bv;
+    if (get_scalar_f32(alpha, &av) != 0 || get_scalar_f32(beta, &bv) != 0)
+        return FWD_RC(rocblas_gemm_strided_batched_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, strideA, b, b_type, ldb, strideB, beta, c, c_type, ldc, strideC,
+                      d, d_type, ldd, strideD, batch_count, compute_type, algo, solution_index, flags);
+    int is_f16 = a_type == rocblas_datatype_f16_r && b_type == rocblas_datatype_f16_r
+                 && c_type == rocblas_datatype_f16_r && d_type == rocblas_datatype_f16_r;
+    int is_bf16 = a_type == rocblas_datatype_bf16_r && b_type == rocblas_datatype_bf16_r
+                  && c_type == rocblas_datatype_bf16_r && d_type == rocblas_datatype_bf16_r;
+    int is_f32 = a_type == rocblas_datatype_f32_r && b_type == rocblas_datatype_f32_r
+                 && c_type == rocblas_datatype_f32_r && d_type == rocblas_datatype_f32_r;
+    if (!is_f16 && !is_bf16 && !is_f32)
+        return FWD_RC(rocblas_gemm_strided_batched_ex, handle, transA, transB, m, n, k, alpha,
+                      a, a_type, lda, strideA, b, b_type, ldb, strideB, beta, c, c_type, ldc, strideC,
+                      d, d_type, ldd, strideD, batch_count, compute_type, algo, solution_index, flags);
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vk] rocblas_gemm_strided_batched_ex %s %s%s m=%d n=%d k=%d bc=%d\n",
+                is_f16 ? "f16" : is_bf16 ? "bf16" : "f32",
+                transA == rocblas_operation_transpose ? "T" : "N",
+                transB == rocblas_operation_transpose ? "T" : "N", m, n, k, batch_count);
+    hipStreamSynchronize(g_stream);
+    vkblas_status_t st;
+    if (is_f16)
+        st = vkblas_gemm_f16(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            (uint32_t)batch_count, strideB, strideA, strideC);
+    else if (is_bf16)
+        st = vkblas_gemm_bf16(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            (uint32_t)batch_count, strideB, strideA, strideC);
+    else
+        st = vkblas_gemm_f32(
+            transB == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            transA == rocblas_operation_transpose ? VKBLAS_OP_T : VKBLAS_OP_N,
+            (uint32_t)n, (uint32_t)m, (uint32_t)k,
+            av, b, (uint32_t)ldb, a, (uint32_t)lda, bv, d, (uint32_t)ldc,
+            (uint32_t)batch_count, strideB, strideA, strideC);
+    if (st == VKBLAS_OK) return rocblas_status_success;
+    return FWD_RC(rocblas_gemm_strided_batched_ex, handle, transA, transB, m, n, k, alpha,
+                  a, a_type, lda, strideA, b, b_type, ldb, strideB, beta, c, c_type, ldc, strideC,
+                  d, d_type, ldd, strideD, batch_count, compute_type, algo, solution_index, flags);
 }

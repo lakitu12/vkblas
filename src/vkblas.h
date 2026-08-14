@@ -43,6 +43,19 @@ vkblas_status_t vkblas_gemm_bf16(
     uint32_t batch,
     int64_t stride_a, int64_t stride_b, int64_t stride_c);
 
+// fp16 GEMM: 语义同 f32, 但 A/B/C 为 fp16 (2B/元素)
+// 内部: fp16 → fp32 (unpackHalf2x16) → fp32 GEMM → fp32 → fp16 回写 (RNE)
+vkblas_status_t vkblas_gemm_f16(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
 // complex64 GEMM: A/B/C 为 complex 交错 (8B/元素), alpha/beta 拆实虚
 // 内部: 拆 4 次 fp32 GEMM (ArBr-AiBi + i(ArBi+AiBr)) + combine
 // 返回 0=已处理, 非 0=引擎不可用 (调用方应转发真库)
