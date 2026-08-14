@@ -166,4 +166,15 @@ test/test_h: test/test_h.c src/vkblas.h libvkblas_hipblas.so
 clean:
 	rm -f libvkblas_hipblas.so test/test_gemm test/test_h $(SHADERS)
 
-.PHONY: all clean
+# --- 部署到本机 ROCm (/opt/rocm-6.4.3/lib) ---
+# 安装版 .so 用 -DVKBLAS_SHADER_DIR 指向固定 shader 目录 (自包含, 不依赖源码树);
+# shaders 目录可被 VKBLAS_SHADER_DIR 环境变量覆盖
+SHADER_INSTALL ?= /opt/rocm-6.4.3/lib/vkblas-shaders
+install: libvkblas_hipblas.so
+	mkdir -p $(SHADER_INSTALL)
+	cp src/shaders/*.spv $(SHADER_INSTALL)/
+	$(CC) $(CFLAGS) -DVKBLAS_SHADER_DIR=\"$(SHADER_INSTALL)\" -shared -o /opt/rocm-6.4.3/lib/libvkblas_hipblas.so \
+	    src/vkblas.c src/vkblas_hipblas.c -ldl -lpthread -lvulkan -lamdhip64 $(LDFLAGS)
+	@echo "installed: /opt/rocm-6.4.3/lib/libvkblas_hipblas.so (shaders -> $(SHADER_INSTALL))"
+
+.PHONY: all clean install

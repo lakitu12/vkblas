@@ -123,7 +123,11 @@ static void* load_hsa(void) {
 
 static int load_spv(const char* name, VkShaderModule* sm) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s", VKBLAS_SHADER_DIR, name);
+    const char* env = getenv("VKBLAS_SHADER_DIR");
+    if (env && *env)
+        snprintf(path, sizeof(path), "%s/%s", env, name);
+    else
+        snprintf(path, sizeof(path), "%s/%s", VKBLAS_SHADER_DIR, name);
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[vkblas] shader %s not found\n", path); return -1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
