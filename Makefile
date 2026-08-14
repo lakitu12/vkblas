@@ -7,6 +7,8 @@ SHADER_DIR = src/shaders
 
 SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm_nt.spv $(SHADER_DIR)/gemm_tt.spv \
+          $(SHADER_DIR)/gemm128_nn.spv $(SHADER_DIR)/gemm128_tn.spv \
+          $(SHADER_DIR)/gemm128_nt.spv $(SHADER_DIR)/gemm128_tt.spv \
           $(SHADER_DIR)/transpose.spv \
           $(SHADER_DIR)/cvt_b2f.spv $(SHADER_DIR)/cvt_b2f_tsp.spv \
           $(SHADER_DIR)/cvt_f2b.spv $(SHADER_DIR)/cvt_f2b_atomic.spv \
@@ -32,6 +34,15 @@ $(SHADER_DIR)/gemm_tt.spv: $(SHADER_DIR)/gemm_tmpl.comp
 	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/transpose.spv: $(SHADER_DIR)/transpose.comp
 	glslangValidator -V $< -o $@
+# --- v7-128 tile (llama.cpp l_warptile 移植: 128×128, BK16, 32 acc/线程) ---
+$(SHADER_DIR)/gemm128_nn.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
+	glslangValidator -V -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128_tn.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
+	glslangValidator -V -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128_nt.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
+	glslangValidator -V -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128_tt.spv: $(SHADER_DIR)/gemm_tmpl_128.comp
+	glslangValidator -V -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/cvt_b2f.spv: $(SHADER_DIR)/cvt_tmpl.comp
 	glslangValidator -V -DCVT_B2F=1 -DCVT_TSP=0 -DCVT_ATOMIC=0 $< -o $@
 $(SHADER_DIR)/cvt_b2f_tsp.spv: $(SHADER_DIR)/cvt_tmpl.comp
