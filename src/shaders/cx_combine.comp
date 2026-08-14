@@ -1,0 +1,46 @@
+#version 450
+// cx_combine: complex64 GEMM 结果组合
+// 输入: Cr, Ci (fp32 平面, 4 次 fp32 GEMM 的实/虚结果), C_old (原 C, complex 交错)
+// 输出: C_out (complex 交错)
+//   C_out.r = ar*Cr - ai*Ci + br*C_old.r - bi*C_old.i   (beta 项仅 beta≠0 时)
+//   C_out.i = ar*Ci + ai*Cr + br*C_old.i + bi*C_old.r
+// 注意: 此公式假设 4 次 GEMM 已按 beta=0 算好 Cr/Ci; beta 项在这里合并
+//       所以 gemm_c64 内部 4 次 GEMM 用 beta=0, 原 C 的 beta 贡献在此完成
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Cr_buf { uint Cr[]; };
+layout(set = 0, binding = 1) buffer Ci_buf { uint Ci[]; };
+layout(set = 0, binding = 2) buffer Cold_buf { uint Cold[]; };  // complex 交错
+layout(set = 0, binding = 3) buffer Cout_buf { uint Cout[]; };  // complex 交错
+layout(push_constant) uniform Params {
+    uint R, C;          // M×N
+    uint ldc;           // C 行步长 (元素)
+    uint roff;
+    float ar, ai;       // alpha 实虚
+    float br, bi;       // beta 实虚 (br==0&&bi==0 时跳过 C_old 读)
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.R * p.C) return;
+    uint r = p.roff + gid / p.C;
+    uint c = gid % p.C;
+    uint idx = r * p.ldc + c;
+    uint cr = Cr[idx];
+    uint ci = Ci[idx];
+    float fr = uintBitsToFloat(cr);
+    float fi = uintBitsToFloat(ci);
+    float or_, oi;
+    if (p.br != 0.0f || p.bi != 0.0f) {
+        uint cr0 = Cold[2u * idx];
+        uint ci0 = Cold[2u * idx + 1u];
+        float fr0 = uintBitsToFloat(cr0);
+        float fi0 = uintBitsToFloat(ci0);
+        or_ = p.ar * fr - p.ai * fi + p.br * fr0 - p.bi * fi0;
+        oi  = p.ar * fi + p.ai * fr + p.br * fi0 + p.bi * fr0;
+    } else {
+        or_ = p.ar * fr - p.ai * fi;
+        oi  = p.ar * fi + p.ai * fr;
+    }
+    Cout[2u * idx] = floatBitsToUint(or_);
+    Cout[2u * idx + 1u] = floatBitsToUint(oi);
+}

@@ -1,0 +1,121 @@
+#version 450
+// GEMM f64 (gfx803 fp64 = 1/16 硬件速率, 正确性优先的慢路径)
+// tile 32×32, 每线程 2×2 = 4 累加器 (local 16×16 = 256 线程)
+// LDS: As[32][34] + Bs[32][34] double = 17KB; 行步长 34 (272B, 8B 对齐)
+// 全部标量 double 读 (dvec2 需 16B 对齐, 输入不保证)
+// 编译期宏 TA/TB
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { double A[]; };
+layout(set = 0, binding = 1) buffer B_buf { double B[]; };
+layout(set = 0, binding = 2) buffer C_buf { double C[]; };
+
+layout(push_constant) uniform Params {
+    uint M, N, K;
+    uint Mt, Nt, Kt;
+    uint lda, ldb, ldc;
+    double alpha, beta;
+} p;
+
+shared double As[32][34];
+shared double Bs[32][34];
+
+void load_tile(uint kt) {
+    uint base_k = kt * 32;
+    uint base_m = gl_WorkGroupID.x * 32;
+    uint base_n = gl_WorkGroupID.y * 32;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16 + lx;
+
+    // A: 32×32 tile, 每线程 2 行(m) × 2 列(k) = 4 元素
+    uint a_row2 = (tid >> 4) * 2;    // 16 组 × 2 = 32 行
+    uint a_col2 = (tid & 15) * 2;    // 16 组 × 2 = 32 列
+#if TA == 1
+    // A 是 (K×M): A_eff[m][k] = A[k*lda+m]
+    for (int c = 0; c < 2; c++) {
+        uint ak = base_k + a_col2 + c;
+        for (int i = 0; i < 2; i++) {
+            uint am = base_m + a_row2 + i;
+            As[a_col2 + c][a_row2 + i] = (ak < p.K && am < p.M) ? A[ak * p.lda + am] : 0.0;
+        }
+    }
+#else
+    // A 是 (M×K): A_eff[m][k] = A[m*lda+k], As[k][m] 转置存
+    for (int r = 0; r < 2; r++) {
+        uint am = base_m + a_row2 + r;
+        uint ak = base_k + a_col2;
+        for (int c = 0; c < 2; c++) {
+            uint kk = ak + uint(c);
+            As[a_col2 + c][a_row2 + r] = (am < p.M && kk < p.K) ? A[am * p.lda + kk] : 0.0;
+        }
+    }
+#endif
+
+    // B: 32×32 tile, 每线程 2 行(k) × 2 列(n) = 4 元素
+    uint b_row2 = (tid >> 4) * 2;
+    uint b_col2 = (tid & 15) * 2;
+#if TB == 1
+    // B 是 (N×K): B_eff[k][n] = B[n*ldb+k], Bs[k][n] 转置存
+    for (int r = 0; r < 2; r++) {
+        uint n = base_n + b_col2 + r;
+        uint krow = base_k + b_row2;
+        double vb0 = (n < p.N && krow < p.K) ? B[n * p.ldb + krow] : 0.0;
+        double vb1 = (n < p.N && krow + 1 < p.K) ? B[n * p.ldb + krow + 1] : 0.0;
+        Bs[b_row2][b_col2 + r] = vb0;
+        Bs[b_row2 + 1][b_col2 + r] = vb1;
+    }
+#else
+    // B 是 (K×N): B_eff[k][n] = B[k*ldb+n], Bs[k][n] 直接存
+    for (int r = 0; r < 2; r++) {
+        uint krow = base_k + b_row2 + r;
+        uint n = base_n + b_col2;
+        for (int c = 0; c < 2; c++) {
+            uint nn = n + uint(c);
+            Bs[b_row2 + r][b_col2 + c] = (krow < p.K && nn < p.N) ? B[krow * p.ldb + nn] : 0.0;
+        }
+    }
+#endif
+}
+
+void main() {
+    uint tgx = gl_WorkGroupID.x, tgy = gl_WorkGroupID.y;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint base_m = tgx * 32, base_n = tgy * 32;
+
+    double acc[2][2];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = 0.0;
+
+    load_tile(0);
+    barrier();
+
+    for (uint kt = 0; kt < p.Kt; kt++) {
+        for (int kk = 0; kk < 32; kk++) {
+            double a0 = As[kk][ly * 2 + 0];
+            double a1 = As[kk][ly * 2 + 1];
+            double b0 = Bs[kk][lx * 2 + 0];
+            double b1 = Bs[kk][lx * 2 + 1];
+            acc[0][0] += a0 * b0;  acc[0][1] += a0 * b1;
+            acc[1][0] += a1 * b0;  acc[1][1] += a1 * b1;
+        }
+        barrier();
+        if (kt + 1 < p.Kt) {
+            load_tile(kt + 1);
+            barrier();
+        }
+    }
+
+    // 写 C: 每线程 2 行 × 2 列
+    for (int i = 0; i < 2; i++) {
+        uint row = base_m + ly * 2 + i;
+        if (row >= p.M) continue;
+        for (int j = 0; j < 2; j++) {
+            uint col = base_n + lx * 2 + j;
+            if (col < p.N) {
+                double cval = (p.beta != 0.0) ? C[row * p.ldc + col] : 0.0;
+                C[row * p.ldc + col] = p.alpha * acc[i][j] + p.beta * cval;
+            }
+        }
+    }
+}

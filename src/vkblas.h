@@ -42,3 +42,30 @@ vkblas_status_t vkblas_gemm_bf16(
     void* C, uint32_t ldc,
     uint32_t batch,
     int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
+// complex64 GEMM: A/B/C 为 complex 交错 (8B/元素), alpha/beta 拆实虚
+// 内部: 拆 4 次 fp32 GEMM (ArBr-AiBi + i(ArBi+AiBr)) + combine
+// 返回 0=已处理, 非 0=引擎不可用 (调用方应转发真库)
+int vkblas_gemm_c64(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha_r, float alpha_i,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta_r, float beta_i,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
+// fp64 GEMM: A/B/C 为 double (8B/元素), 纯 double shader
+// 返回 0=已处理, 非 0=引擎不可用 (调用方应转发真库)
+int vkblas_gemm_f64(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    double alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    double beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);
