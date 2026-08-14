@@ -1,0 +1,156 @@
+#version 450
+// GEMM f32 v6: tile 64×64 (M×N), 每线程 4×4 = 16 累加器 (local 16×16 = 256 线程 = 4 wave)
+// LDS 行步长 66/66 (≡2 mod 32): bank 16 组 → 2-4 路写冲突
+// 全部 b64 读/写 (8B 对齐): 66×4B=264 ≡ 8 mod 16, 不能 b128
+// LDS 16.9KB → 3 wg/CU = 12 wave (占用 30%)
+// 内循环: 4×b64 读 (8 floats) + 16 FMA → 0.5 LDS bank-cycle/FMA (v5 是 0.75)
+// 全局读 8GB (Mt=64, Nt=64) — v5 12GB
+// 写 C: wave 内 16 行 × 每行 256B (16 lx × 16B)
+// 编译期宏 TA/TB
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { float A[]; };
+layout(set = 0, binding = 1) buffer B_buf { float B[]; };
+layout(set = 0, binding = 2) buffer C_buf { float C[]; };
+
+layout(push_constant) uniform Params {
+    uint M, N, K;
+    uint Mt, Nt, Kt;
+    uint lda, ldb, ldc;
+    float alpha, beta;
+} p;
+
+// As[k][m]: k 32 行 × m 64 列, 行步长 66 (64+2, b64 对齐 + bank 16 组)
+// Bs[k][n]: k 32 行 × n 64 列, 行步长 66 (64+2)
+shared float As[32][66];
+shared float Bs[32][66];
+
+void load_tile(uint kt) {
+    uint base_k = kt * 32;
+    uint base_m = gl_WorkGroupID.x * 64;
+    uint base_n = gl_WorkGroupID.y * 64;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16 + lx;   // 256 线程
+
+    // A: 64×32 tile, 每线程 4 行(m) × 2 列(k) = 8 元素
+    uint a_row4 = (tid >> 4) * 4;    // 16 组 × 4 = 64 行
+    uint a_col2 = (tid & 15) * 2;    // 16 组 × 2 = 32 列
+#if TA == 1
+    // A 是 (K×M): A_eff[m][k] = A[k*lda+m], As[k][m] 直接存
+    for (int c = 0; c < 2; c++) {
+        uint ak = base_k + a_col2 + c;
+        uint am = base_m + a_row4;
+        if (ak < p.K && am + 3 < p.M) {
+            vec4 v = vec4(A[ak * p.lda + am], A[ak * p.lda + am + 1],
+                          A[ak * p.lda + am + 2], A[ak * p.lda + am + 3]);
+            As[a_col2 + c][a_row4 + 0] = v.x; As[a_col2 + c][a_row4 + 1] = v.y;
+            As[a_col2 + c][a_row4 + 2] = v.z; As[a_col2 + c][a_row4 + 3] = v.w;
+        } else {
+            for (int i = 0; i < 4; i++) {
+                uint mm = am + uint(i);
+                As[a_col2 + c][a_row4 + i] = (ak < p.K && mm < p.M) ? A[ak * p.lda + mm] : 0.0;
+            }
+        }
+    }
+#else
+    // A 是 (M×K): A_eff[m][k] = A[m*lda+k], As[k][m] 转置存
+    // 读 A[am*lda + ak..ak+1] (k 连续 b64), 写 As[k][m] 转置 (2 k 行 × 4 m 列)
+    for (int r = 0; r < 4; r++) {
+        uint am = base_m + a_row4 + r;
+        uint ak = base_k + a_col2;
+        if (am < p.M && ak + 1 < p.K) {
+            vec2 v = vec2(A[am * p.lda + ak], A[am * p.lda + ak + 1]);
+            As[a_col2 + 0][a_row4 + r] = v.x; As[a_col2 + 1][a_row4 + r] = v.y;
+        } else {
+            for (int c = 0; c < 2; c++) {
+                uint kk = ak + uint(c);
+                As[a_col2 + c][a_row4 + r] = (am < p.M && kk < p.K) ? A[am * p.lda + kk] : 0.0;
+            }
+        }
+    }
+#endif
+
+    // B: 32×64 tile, 每线程 2 行(k) × 4 列(n) = 8 元素
+    uint b_row2 = (tid >> 4) * 2;    // 16 组 × 2 = 32 行
+    uint b_col4 = (tid & 15) * 4;    // 16 组 × 4 = 64 列
+#if TB == 1
+    // B 是 (N×K): B_eff[k][n] = B[n*ldb+k], Bs[k][n] 转置存
+    // 每 k 行独立标量写: 防止编译器跨行合并 (ISA 实测 st64 错位风险)
+    for (int r = 0; r < 4; r++) {
+        uint n = base_n + b_col4 + r;
+        uint krow = base_k + b_row2;
+        float vb0 = (n < p.N && krow < p.K) ? B[n * p.ldb + krow] : 0.0;
+        float vb1 = (n < p.N && krow + 1 < p.K) ? B[n * p.ldb + krow + 1] : 0.0;
+        Bs[b_row2][b_col4 + r] = vb0;
+        Bs[b_row2 + 1][b_col4 + r] = vb1;
+    }
+#else
+    // B 是 (K×N): B_eff[k][n] = B[k*ldb+n], Bs[k][n] 直接存
+    // 读 B[krow*ldb + n..n+3] (n 连续 vec4), 写 Bs[k][n] 直接
+    for (int r = 0; r < 2; r++) {
+        uint krow = base_k + b_row2 + r;
+        uint n = base_n + b_col4;
+        if (krow < p.K && n + 3 < p.N) {
+            vec4 v = vec4(B[krow * p.ldb + n], B[krow * p.ldb + n + 1],
+                          B[krow * p.ldb + n + 2], B[krow * p.ldb + n + 3]);
+            Bs[b_row2 + r][b_col4 + 0] = v.x; Bs[b_row2 + r][b_col4 + 1] = v.y;
+            Bs[b_row2 + r][b_col4 + 2] = v.z; Bs[b_row2 + r][b_col4 + 3] = v.w;
+        } else {
+            for (int c = 0; c < 4; c++) {
+                uint nn = n + uint(c);
+                Bs[b_row2 + r][b_col4 + c] = (krow < p.K && nn < p.N) ? B[krow * p.ldb + nn] : 0.0;
+            }
+        }
+    }
+#endif
+}
+
+void main() {
+    uint tgx = gl_WorkGroupID.x, tgy = gl_WorkGroupID.y;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint base_m = tgx * 64, base_n = tgy * 64;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = 0.0;
+
+    load_tile(0);
+    barrier();
+
+    for (uint kt = 0; kt < p.Kt; kt++) {
+        for (int kk = 0; kk < 32; kk++) {
+            // 4×b64 LDS 读 (8 floats) + 16 FMA → 0.5 bank-cycle/FMA
+            float arow[4], brow[4];
+            arow[0] = As[kk][ly * 4 + 0];
+            arow[1] = As[kk][ly * 4 + 1];
+            arow[2] = As[kk][ly * 4 + 2];
+            arow[3] = As[kk][ly * 4 + 3];
+            brow[0] = Bs[kk][lx * 4 + 0];
+            brow[1] = Bs[kk][lx * 4 + 1];
+            brow[2] = Bs[kk][lx * 4 + 2];
+            brow[3] = Bs[kk][lx * 4 + 3];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] += arow[i] * brow[j];
+        }
+        barrier();
+        if (kt + 1 < p.Kt) {
+            load_tile(kt + 1);
+            barrier();
+        }
+    }
+
+    // 写 C: 每线程 4 行 × 4 列; wave 内 16 行 × 每行 256B (16 lx × 16B)
+    for (int i = 0; i < 4; i++) {
+        uint row = base_m + ly * 4 + i;
+        if (row >= p.M) continue;
+        for (int j = 0; j < 4; j++) {
+            uint col = base_n + lx * 4 + j;
+            if (col < p.N) {
+                float cval = (p.beta != 0.0) ? C[row * p.ldc + col] : 0.0;
+                C[row * p.ldc + col] = p.alpha * acc[i][j] + p.beta * cval;
+            }
+        }
+    }
+}

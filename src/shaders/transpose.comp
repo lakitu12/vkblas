@@ -1,0 +1,41 @@
+#version 450
+// transpose v4: vec4 连续读 + 4 分散标量写 + roff 行偏移 (分块 dispatch 支持)
+// gfx803/RADV 实测: 分散写比连续写快 ~3 倍; 单次 dispatch >8MB 性能崩溃,
+// 因此 host 侧按 512 行拆多个 dispatch, 每块用 roff 定位行基址
+// In (R×C row-major, ldin) → Out (C×R row-major, ldout)
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer In_buf { float In[]; };
+layout(set = 0, binding = 1) buffer Out_buf { float Out[]; };
+layout(push_constant) uniform Params {
+    uint R, C;      // In 是 (R×C) row-major, Out 是 (C×R); R/C 为总尺寸
+    uint ldin;      // In 行步长
+    uint ldout;     // Out 行步长
+    uint roff;      // 本 dispatch 的行偏移 (分块)
+} p;
+
+void main() {
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16 + lx;
+    uint br = p.roff + gl_WorkGroupID.x * 32;
+    uint bc = gl_WorkGroupID.y * 32;
+
+    uint r = br + (tid >> 3);
+    uint c = bc + (tid & 7) * 4;
+    if (r < p.R && c + 3 < p.C) {
+        uint base = r * p.ldin + c;
+        float v0 = In[base + 0];
+        float v1 = In[base + 1];
+        float v2 = In[base + 2];
+        float v3 = In[base + 3];
+        Out[c * p.ldout + r] = v0;
+        Out[(c + 1) * p.ldout + r] = v1;
+        Out[(c + 2) * p.ldout + r] = v2;
+        Out[(c + 3) * p.ldout + r] = v3;
+    } else {
+        for (int i = 0; i < 4; i++) {
+            uint cc = c + uint(i);
+            if (r < p.R && cc < p.C)
+                Out[cc * p.ldout + r] = In[r * p.ldin + cc];
+        }
+    }
+}
