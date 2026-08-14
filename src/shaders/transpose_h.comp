@@ -1,0 +1,53 @@
+#version 450
+// transpose_h: f16/bf16 (2B/元素) 转置, -D HALF_TYPE=1 (fp16) / 2 (bf16)
+// In (R×C row-major, ldin) → Out (C×R row-major, ldout)
+// 每线程 2 源行 × 1 源列 → 写目标行内 2 连续元素 (1 uint)
+// host 保证 ldout 偶 (行首 uint 对齐, 无跨行共享) + r0 偶 (行内 2 元素对) → 直接写
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer In_buf { uint In[]; };
+layout(set = 0, binding = 1) buffer Out_buf { uint Out[]; };
+layout(push_constant) uniform Params {
+    uint R, C;
+    uint ldin;
+    uint ldout;
+    uint roff;
+} p;
+
+float hx(uint u, uint hb) {
+#if HALF_TYPE == 1
+    return unpackHalf2x16(u)[hb];
+#else
+    return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u);
+#endif
+}
+float load1(uint e) {
+    return hx(In[e >> 1], e & 1u);
+}
+uint f2h(float v) {
+#if HALF_TYPE == 1
+    return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu;
+#else
+    uint u = floatBitsToUint(v);
+    return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0xFFFFu;   // RNE
+#endif
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16 + lx;
+    uint r0 = p.roff + gl_WorkGroupID.x * 32 + (tid >> 4) * 2;   // 偶
+    uint c = gl_WorkGroupID.y * 16 + (tid & 15);
+
+    if (c >= p.C) return;
+    if (r0 + 1 < p.R) {
+        float v0 = load1(r0 * p.ldin + c);
+        float v1 = load1((r0 + 1) * p.ldin + c);
+        // 目标行 c, 元素 r0, r0+1 → e = c*ldout + r0 (偶) → 1 uint
+        Out[(c * p.ldout + r0) >> 1] = f2h(v0) | (f2h(v1) << 16u);
+    } else if (r0 < p.R) {
+        // R 奇: 行尾单元素
+        float v0 = load1(r0 * p.ldin + c);
+        uint e = c * p.ldout + r0;
+        Out[e >> 1] = (Out[e >> 1] & 0xFFFF0000u) | f2h(v0);
+    }
+}

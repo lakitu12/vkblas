@@ -37,6 +37,11 @@ static struct {
     VkPipelineLayout pl;
     VkPipeline pipe[4];   // idx = op_a*2 + op_b: nn,tn,nt,tt
     VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 32 acc/线程
+    // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
+    // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
+    VkPipeline pipe_h[2][4];
+    VkPipeline pipe128_h[2][4];
+    VkPipeline tpipe_h[2];
     VkDescriptorSet dset;
     // 转置 (TB=0 快路径支持)
     VkDescriptorSetLayout tdsl;
@@ -278,6 +283,47 @@ static void init_vkblas(void) {
         VkDescriptorSetAllocateInfo cdai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.tdsl };
         vk_check(vkAllocateDescriptorSets(g.dev, &cdai, &g.cdset[i]), "c dset");
+    }
+
+    // ---- f16/bf16 直通 GEMM pipeline (复用 g.dsl/g.pl: 3 storage + 44B push) ----
+    // dtype: 0 = fp16 (h16), 1 = bf16 (b16); 缺 shader 则对应 dtype 回退旧 cvt 管道
+    static const char* hnames[2][4] = {
+        { "gemm_h16_nn.spv", "gemm_h16_nt.spv", "gemm_h16_tn.spv", "gemm_h16_tt.spv" },
+        { "gemm_b16_nn.spv", "gemm_b16_nt.spv", "gemm_b16_tn.spv", "gemm_b16_tt.spv" } };
+    static const char* h128names[2][4] = {
+        { "gemm128_h16_nn.spv", "gemm128_h16_nt.spv", "gemm128_h16_tn.spv", "gemm128_h16_tt.spv" },
+        { "gemm128_b16_nn.spv", "gemm128_b16_nt.spv", "gemm128_b16_tn.spv", "gemm128_b16_tt.spv" } };
+    static const char* htnames[2] = { "transpose_h16.spv", "transpose_b16.spv" };
+    for (int d = 0; d < 2; d++) {
+        for (int i = 0; i < 4; i++) {
+            g.pipe_h[d][i] = VK_NULL_HANDLE;
+            g.pipe128_h[d][i] = VK_NULL_HANDLE;
+            if (load_spv(hnames[d][i], &sm) == 0) {
+                VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                               VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                    .layout = g.pl };
+                vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe_h[d][i]), "h pipe");
+                vkDestroyShaderModule(g.dev, sm, NULL);
+            }
+            if (load_spv(h128names[d][i], &sm) == 0) {
+                VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                               VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                    .layout = g.pl };
+                vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128_h[d][i]), "h128 pipe");
+                vkDestroyShaderModule(g.dev, sm, NULL);
+            }
+        }
+        g.tpipe_h[d] = VK_NULL_HANDLE;
+        if (load_spv(htnames[d], &sm) == 0) {
+            VkComputePipelineCreateInfo tp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                           VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                .layout = g.tpl };
+            vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &tp, NULL, &g.tpipe_h[d]), "ht pipe");
+            vkDestroyShaderModule(g.dev, sm, NULL);
+        }
     }
 
     // ---- complex64: cvt_cx pipeline (3 storage buffer + 20B push) ----
@@ -560,6 +606,216 @@ static int transpose_buf(const void* in, size_t bytes_in,
     int rc = transpose_vk(bIn, bytes_in, K, N, ldin, out_vk, ldout);
     release_ptr(mIn, bIn);
     return rc;
+}
+
+// ---- f16/bf16 直通 (llama.cpp mul_mm 思路) ----
+// 转置核心 (2B 元素): out[N][K] = in[K][N]^T, 输出行步长 pad 偶 (消除跨行共享 uint)
+// dtype: 0 = fp16, 1 = bf16
+static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t need,
+                            uint32_t K, uint32_t N, uint32_t ldin,
+                            uint32_t* ldout, int dtype) {
+    VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, need} };
+    VkWriteDescriptorSet wds[2];
+    for (int i = 0; i < 2; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.tdset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 2, wds, 0, NULL);
+
+    // Out 是 (N×K), 行步长 pad 偶 (K 奇时 +1, 保证行首 uint 对齐)
+    uint32_t ldout_pad = K + (K & 1u);
+    struct { uint32_t R, C, ldin, ldout, roff; } pc = { K, N, ldin, ldout_pad, 0 };
+    vkResetCommandBuffer(g.cmd, 0);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(g.cmd, &cbbi);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpipe_h[dtype]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.tdset, 0, NULL);
+    // 8MB/块分块 (2B 元素: 行字节 = N*2)
+    const uint32_t ROWS_PER_DISP = (8u * 1024 * 1024) / (N * 2u);
+    uint32_t rpd = ROWS_PER_DISP < 32 ? 32 : (ROWS_PER_DISP > 4096 ? 4096 : ROWS_PER_DISP);
+    for (uint32_t ro = 0; ro < K; ro += rpd) {
+        pc.roff = ro;
+        uint32_t rows = K - ro < rpd ? K - ro : rpd;
+        vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g.cmd, (rows + 31) / 32, (N + 15) / 16, 1);
+    }
+    vkEndCommandBuffer(g.cmd);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+    vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "ht submit");
+    vkQueueWaitIdle(g.queue);
+
+    *ldout = ldout_pad;
+    return 0;
+}
+
+// 转置 (2B): 内部 buffer 池版
+static int transpose_h_vk(VkBuffer bIn, size_t bytes_in,
+                          uint32_t K, uint32_t N, uint32_t ldin,
+                          VkBuffer* out_vk, uint32_t* ldout, int dtype) {
+    size_t need = (size_t)N * (K + (K & 1u)) * 2;
+    if (g.tbuf == VK_NULL_HANDLE || need > g.tbuf_size) {
+        if (g.tbuf != VK_NULL_HANDLE) {
+            vkFreeMemory(g.dev, g.tmem, NULL);
+            vkDestroyBuffer(g.dev, g.tbuf, NULL);
+        }
+        VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = need, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        if (vkCreateBuffer(g.dev, &bci, NULL, &g.tbuf) != VK_SUCCESS) return -1;
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(g.dev, g.tbuf, &mr);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mr.size };
+        VkPhysicalDeviceMemoryProperties mprops;
+        vkGetPhysicalDeviceMemoryProperties(g.phys, &mprops);
+        for (uint32_t i = 0; i < mprops.memoryTypeCount; i++) {
+            if (mr.memoryTypeBits & (1u << i) &&
+                (mprops.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                mai.memoryTypeIndex = i; break;
+            }
+        }
+        if (vkAllocateMemory(g.dev, &mai, NULL, &g.tmem) != VK_SUCCESS) return -1;
+        if (vkBindBufferMemory(g.dev, g.tbuf, g.tmem, 0) != VK_SUCCESS) return -1;
+        g.tbuf_size = need;
+    }
+    int rc = transpose_h_into(bIn, bytes_in, g.tbuf, need, K, N, ldin, ldout, dtype);
+    if (rc == 0) *out_vk = g.tbuf;
+    return rc;
+}
+
+// 直通 GEMM 提交 (v6 tile, 2B 元素; 复用 g.dsl/g.pl, 44B push)
+static int run_gemm_h(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                      VkBuffer bC, size_t bc,
+                      uint32_t M, uint32_t N, uint32_t K,
+                      uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      float alpha, float beta) {
+    if (g.pipe_h[dtype][variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
+        M, N, K, (M + 63) / 64, (N + 63) / 64, (K + 31) / 32, lda, ldb, ldc, alpha, beta };
+
+    vkResetCommandBuffer(g.cmd, 0);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(g.cmd, &cbbi);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_h[dtype][variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkEndCommandBuffer(g.cmd);
+
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+    vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "submit_h");
+    vkQueueWaitIdle(g.queue);
+    return 0;
+}
+
+// 直通 GEMM 提交 (v7-128 tile, 2B 元素)
+static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                         VkBuffer bC, size_t bc,
+                         uint32_t M, uint32_t N, uint32_t K,
+                         uint32_t lda, uint32_t ldb, uint32_t ldc,
+                         float alpha, float beta) {
+    if (g.pipe128_h[dtype][variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc, alpha, beta };
+
+    vkResetCommandBuffer(g.cmd, 0);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(g.cmd, &cbbi);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128_h[dtype][variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkEndCommandBuffer(g.cmd);
+
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
+    vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "submit_h128");
+    vkQueueWaitIdle(g.queue);
+    return 0;
+}
+
+// 直通 GEMM 主路径 (f16/bf16, llama.cpp mul_mm 思路): 2B 半精度 A/B/C 直接进 shader
+// host 保证 ldc 偶 && N 偶; op_b==N 时 B 先 transpose_h (输出行步长 pad 偶)
+// dtype: 0 = fp16, 1 = bf16; 调用方持锁
+static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op_b,
+                                     uint32_t M, uint32_t N, uint32_t K,
+                                     float alpha,
+                                     const void* A, uint32_t lda,
+                                     const void* B, uint32_t ldb,
+                                     float beta,
+                                     void* C, uint32_t ldc,
+                                     uint32_t batch,
+                                     int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    uint32_t Ra = (op_a == VKBLAS_OP_T) ? K : M;
+    uint32_t Ca = (op_a == VKBLAS_OP_T) ? M : K;
+    size_t ba_e = (size_t)(Ra - 1) * lda + Ca;
+    size_t bb_e;
+    int variant;
+    if (op_b == VKBLAS_OP_N) {
+        bb_e = (size_t)(K - 1) * ldb + N;
+        variant = (int)op_a * 2 + 1;                      // 转置后 TB=1
+    } else {
+        bb_e = (size_t)(N - 1) * ldb + K;
+        variant = (int)op_a * 2 + (int)op_b;
+    }
+    size_t bc_e = (size_t)(M - 1) * ldc + N;
+
+    const char* pa = (const char*)A, *pb = (const char*)B, *pc = (const char*)C;
+    int trace = getenv("VKBLAS_TRACE") != NULL;
+    for (uint32_t i = 0; i < batch; i++) {
+        VkBuffer bA, bB, bC; VkDeviceMemory mA, mB, mC; VkDeviceSize oA, oB, oC;
+        if (import_ptr(pa, ba_e * 2, &bA, &mA, &oA) != 0) return VKBLAS_ERR_IMPORT;
+        if (import_ptr(pb, bb_e * 2, &bB, &mB, &oB) != 0) { release_ptr(mA, bA); return VKBLAS_ERR_IMPORT; }
+        if (import_ptr(pc, bc_e * 2, &bC, &mC, &oC) != 0) { release_ptr(mA, bA); release_ptr(mB, bB); return VKBLAS_ERR_IMPORT; }
+
+        int rc = 0;
+        VkBuffer bBt = VK_NULL_HANDLE;
+        uint32_t ldb_eff = ldb;
+        if (op_b == VKBLAS_OP_N) {
+            // B (K×N) → 转置 (N×K), 行步长 pad 偶 → TB=1 快路径
+            if (transpose_h_vk(bB, bb_e * 2, K, N, ldb, &bBt, &ldb_eff, dtype) != 0) rc = -1;
+        }
+        if (rc == 0) {
+            size_t bb_used = bb_e * 2;
+            if (bBt != VK_NULL_HANDLE) bb_used = (size_t)N * ldb_eff * 2;
+            VkBuffer bB_eff = bBt != VK_NULL_HANDLE ? bBt : bB;
+            if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256)
+                rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB_eff,
+                                   bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc, alpha, beta);
+            else
+                rc = run_gemm_h(dtype, variant, bA, ba_e * 2, bB_eff,
+                                bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc, alpha, beta);
+        }
+        release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+        if (trace)
+            fprintf(stderr, "[vk] %s direct: batch %u done (rc=%d)\n", dtype ? "bf16" : "f16", i, rc);
+        if (rc != 0) return VKBLAS_ERR_IMPORT;
+        pa += stride_a * 2; pb += stride_b * 2; pc += stride_c * 2;
+    }
+    return VKBLAS_OK;
 }
 
 // 纯 VkBuffer 版 GEMM 提交 (buffer 已 import 或为内部 buffer, 由调用方管理生命周期)
@@ -848,6 +1104,15 @@ vkblas_status_t vkblas_gemm_bf16(
         pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_INIT;
     }
 
+    // ---- 直通快路径 (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer) ----
+    // 条件: ldc 偶 && N 偶 (否则行尾/行首跨 uint 竞争); bf16 直通 pipeline 可用
+    if ((ldc & 1u) == 0 && (N & 1u) == 0 && g.pipe_h[1][0] != VK_NULL_HANDLE) {
+        int rc = gemm_h_direct(1, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                               batch, stride_a, stride_b, stride_c);
+        pthread_mutex_unlock(&g.lock);
+        return rc;
+    }
+
     // 有效区域与字节数 (元素单位)
     uint32_t Ra = (op_a == VKBLAS_OP_T) ? K : M;          // A 行数
     uint32_t Ca = (op_a == VKBLAS_OP_T) ? M : K;          // A 每行有效元素
@@ -953,6 +1218,14 @@ vkblas_status_t vkblas_gemm_f16(
     ensure_init();
     if (!g.ready || g.cpipe[4] == VK_NULL_HANDLE) {
         pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_INIT;
+    }
+
+    // ---- 直通快路径 (fp16): 条件同 bf16 (ldc 偶 && N 偶) ----
+    if ((ldc & 1u) == 0 && (N & 1u) == 0 && g.pipe_h[0][0] != VK_NULL_HANDLE) {
+        int rc = gemm_h_direct(0, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                               batch, stride_a, stride_b, stride_c);
+        pthread_mutex_unlock(&g.lock);
+        return rc;
     }
 
     // 有效区域与字节数 (元素单位)
