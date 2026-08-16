@@ -8,6 +8,7 @@ typedef enum {
     VKBLAS_ERR_INIT,     // Vulkan/HSA 初始化失败
     VKBLAS_ERR_IMPORT,   // dma-buf 导入失败(调用方应 fallback 转发)
     VKBLAS_ERR_PARAM,    // 参数错误
+    VKBLAS_ERR_FALLBACK  // batch 合并不可行(跨分配等), 调用方应回退逐 batch 循环
 } vkblas_status_t;
 
 typedef enum { VKBLAS_OP_N = 0, VKBLAS_OP_T = 1 } vkblas_op_t;

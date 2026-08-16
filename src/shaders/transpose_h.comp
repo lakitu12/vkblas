@@ -11,6 +11,9 @@ layout(push_constant) uniform Params {
     uint ldin;
     uint ldout;
     uint roff;
+    uint batch;     // batch 数 (z 轴)
+    uint batch_base;                    // 本 dispatch 的 batch 起点 (z>16 串行, 拆批)
+    uint stride_in; uint stride_out;   // batch 元素偏移
 } p;
 
 float hx(uint u, uint hb) {
@@ -37,17 +40,19 @@ void main() {
     uint tid = ly * 16 + lx;
     uint r0 = p.roff + gl_WorkGroupID.x * 32 + (tid >> 4) * 2;   // 偶
     uint c = gl_WorkGroupID.y * 16 + (tid & 15);
+    uint in_off = (p.batch_base + gl_WorkGroupID.z) * p.stride_in;
+    uint out_off = (p.batch_base + gl_WorkGroupID.z) * p.stride_out;
 
     if (c >= p.C) return;
     if (r0 + 1 < p.R) {
-        float v0 = load1(r0 * p.ldin + c);
-        float v1 = load1((r0 + 1) * p.ldin + c);
+        float v0 = load1(in_off + r0 * p.ldin + c);
+        float v1 = load1(in_off + (r0 + 1) * p.ldin + c);
         // 目标行 c, 元素 r0, r0+1 → e = c*ldout + r0 (偶) → 1 uint
-        Out[(c * p.ldout + r0) >> 1] = f2h(v0) | (f2h(v1) << 16u);
+        Out[((out_off + c * p.ldout + r0) >> 1)] = f2h(v0) | (f2h(v1) << 16u);
     } else if (r0 < p.R) {
         // R 奇: 行尾单元素
-        float v0 = load1(r0 * p.ldin + c);
-        uint e = c * p.ldout + r0;
+        float v0 = load1(in_off + r0 * p.ldin + c);
+        uint e = out_off + c * p.ldout + r0;
         Out[e >> 1] = (Out[e >> 1] & 0xFFFF0000u) | f2h(v0);
     }
 }

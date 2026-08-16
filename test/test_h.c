@@ -151,6 +151,73 @@ int main(void) {
             }
         }
     }
+
+    // ---- batch 合并 (直通快路径): batch=4, 紧密 stride, 对比 CPU 逐 batch ----
+    const int bshapes[][3] = { {64,64,64}, {128,128,128}, {96,48,32} };
+    int nb = sizeof(bshapes)/sizeof(bshapes[0]);
+    const int NB = 4;
+    for (int dt = 0; dt < 2; dt++) {
+        gemm_fn fn = dt ? gemm : gemm16;
+        const char* dname = dt ? "bf16" : "fp16";
+        for (int op_a = 0; op_a < 2; op_a++) {
+            for (int op_b = 0; op_b < 2; op_b++) {
+                for (int s = 0; s < nb; s++) {
+                    int M = bshapes[s][0], N = bshapes[s][1], K = bshapes[s][2];
+                    int lda = K, ldb = op_b ? K : N, ldc = N;   // 紧密 (ldc=N 偶)
+                    size_t ba1 = (size_t)((op_a ? K : M) - 1) * lda + (op_a ? M : K);
+                    size_t bb1 = (size_t)((op_b ? N : K) - 1) * ldb + (op_b ? K : N);
+                    size_t bc1 = (size_t)(M - 1) * ldc + N;
+                    int64_t sa = lda * (op_a ? K : M), sb = ldb * (op_b ? N : K), sc = ldc * M;  // C 每 batch 占 M 行×ldc
+                    size_t ba = ba1 + sa * (NB - 1), bb = bb1 + sb * (NB - 1), bc = bc1 + sc * (NB - 1);
+                    uint16_t *hA = malloc(ba * 2), *hB = malloc(bb * 2), *hC = malloc(bc * 2), *hR = malloc(bc * 2);
+                    for (size_t i = 0; i < ba; i++) hA[i] = f2h(((float)rand() / RAND_MAX * 2.0f - 1.0f));
+                    for (size_t i = 0; i < bb; i++) hB[i] = f2h(((float)rand() / RAND_MAX * 2.0f - 1.0f));
+                    for (size_t i = 0; i < bc; i++) hC[i] = f2h(((float)rand() / RAND_MAX * 2.0f - 1.0f));
+                    if (dt) {
+                        for (size_t i = 0; i < ba; i++) hA[i] = f2bf((float)rand() / RAND_MAX * 2.0f - 1.0f);
+                        for (size_t i = 0; i < bb; i++) hB[i] = f2bf((float)rand() / RAND_MAX * 2.0f - 1.0f);
+                        for (size_t i = 0; i < bc; i++) hC[i] = f2bf((float)rand() / RAND_MAX * 2.0f - 1.0f);
+                    }
+                    memcpy(hR, hC, bc * 2);
+                    float alpha = 1.0f, beta = 0.5f;
+                    for (int b = 0; b < NB; b++)
+                        cpu_ref(dt, op_a, op_b, M, N, K,
+                                hA + sa * b, lda, hB + sb * b, ldb, alpha, beta, hR + sc * b, ldc);
+
+                    void *dA, *dB, *dC;
+                    hipMalloc(&dA, ba * 2); hipMalloc(&dB, bb * 2); hipMalloc(&dC, bc * 2);
+                    hipMemcpy(dA, hA, ba * 2, hipMemcpyHostToDevice);
+                    hipMemcpy(dB, hB, bb * 2, hipMemcpyHostToDevice);
+                    hipMemcpy(dC, hC, bc * 2, hipMemcpyHostToDevice);
+
+                    int rc = fn(op_a, op_b, M, N, K, alpha, dA, lda, dB, ldb, beta, dC, ldc,
+                                NB, sa, sb, sc);
+                    hipMemcpy(hC, dC, bc * 2, hipMemcpyDeviceToHost);
+
+                    float maxerr = 0;
+                    for (int b = 0; b < NB; b++)
+                        for (int m = 0; m < M; m++)
+                            for (int n = 0; n < N; n++) {
+                                float got = dt ? bf2f(hC[sc * b + m * ldc + n]) : h2f(hC[sc * b + m * ldc + n]);
+                                float want = dt ? bf2f(hR[sc * b + m * ldc + n]) : h2f(hR[sc * b + m * ldc + n]);
+                                float e = fabsf(got - want);
+                                if (e > maxerr) maxerr = e;
+                            }
+                    int ok = (rc == 0 && maxerr < 0.05f);
+                    if (!ok) {
+                        printf("BATCH %s op_a=%d op_b=%d %dx%dx%d b=%d: rc=%d maxerr=%.3e FAIL\n",
+                               dname, op_a, op_b, M, N, K, NB, rc, maxerr);
+                        fails++;
+                    } else {
+                        printf("BATCH %s op_a=%d op_b=%d %dx%dx%d b=%d: rc=%d maxerr=%.3e OK\n",
+                               dname, op_a, op_b, M, N, K, NB, rc, maxerr);
+                    }
+                    hipFree(dA); hipFree(dB); hipFree(dC);
+                    free(hA); free(hB); free(hC); free(hR);
+                }
+            }
+        }
+    }
     printf("fails=%d\n", fails);
     return fails != 0;
 }

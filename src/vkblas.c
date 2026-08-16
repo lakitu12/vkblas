@@ -570,7 +570,8 @@ static void release_ptr(VkDeviceMemory mem, VkBuffer buf) {
 // 转置核心: out[N][K] = in[K][N]^T (row-major), in 行步长 ldin, out 紧密 (行步长 N)
 // bOut 由调用方提供 (可为 tbuf 池或内部 buffer)
 static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t need,
-                          uint32_t K, uint32_t N, uint32_t ldin, uint32_t* ldout) {
+                          uint32_t K, uint32_t N, uint32_t ldin, uint32_t* ldout,
+                          uint32_t batch, int64_t stride_in, int64_t stride_out) {
     VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, need} };
     VkWriteDescriptorSet wds[2];
     for (int i = 0; i < 2; i++) {
@@ -581,7 +582,9 @@ static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t n
     vkUpdateDescriptorSets(g.dev, 2, wds, 0, NULL);
 
     // Out 是 (N×K) 紧密, 行步长 = K (不是 N! 非方阵时 N≠K 会写错位)
-    struct { uint32_t R, C, ldin, ldout, roff; } pc = { K, N, ldin, K, 0 };
+    // batch_base: RADV/gfx803 z>16 后 workgroup 调度串行, 拆批 z≤16
+    struct { uint32_t R, C, ldin, ldout, roff, batch, batch_base, stride_in, stride_out; } pc = {
+        K, N, ldin, K, 0, 0, 0, (uint32_t)stride_in, (uint32_t)stride_out };
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(g.cmd, &cbbi);
@@ -590,11 +593,15 @@ static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t n
     // 按 8MB/块动态分块 (实测最优 ~2048 wg/8MB; 固定 512 行对小 N 块太小)
     const uint32_t ROWS_PER_DISP = (8u * 1024 * 1024) / (N * 4u);  // 8MB / 行字节数
     uint32_t rpd = ROWS_PER_DISP < 32 ? 32 : (ROWS_PER_DISP > 4096 ? 4096 : ROWS_PER_DISP);
-    for (uint32_t ro = 0; ro < K; ro += rpd) {
-        pc.roff = ro;
-        uint32_t rows = K - ro < rpd ? K - ro : rpd;
-        vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(g.cmd, (rows + 31) / 32, (N + 31) / 32, 1);
+    for (uint32_t bo = 0; bo < batch; bo += 16) {
+        pc.batch_base = bo;
+        pc.batch = batch - bo < 16 ? batch - bo : 16;
+        for (uint32_t ro = 0; ro < K; ro += rpd) {
+            pc.roff = ro;
+            uint32_t rows = K - ro < rpd ? K - ro : rpd;
+            vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(g.cmd, (rows + 31) / 32, (N + 31) / 32, pc.batch);
+        }
     }
     vkEndCommandBuffer(g.cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -609,8 +616,9 @@ static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t n
 // 转置: 内部 buffer 版 (bf16/complex 回退用); 输出全局池 tbuf, 用完即复用
 static int transpose_vk(VkBuffer bIn, size_t bytes_in,
                         uint32_t K, uint32_t N, uint32_t ldin,
-                        VkBuffer* out_vk, uint32_t* ldout) {
-    size_t need = (size_t)N * K * 4;
+                        VkBuffer* out_vk, uint32_t* ldout,
+                        uint32_t batch, int64_t stride_in, int64_t stride_out) {
+    size_t need = (size_t)batch * N * K * 4;
     if (g.tbuf == VK_NULL_HANDLE || need > g.tbuf_size) {
         if (g.tbuf != VK_NULL_HANDLE) {
             vkFreeMemory(g.dev, g.tmem, NULL);
@@ -636,18 +644,23 @@ static int transpose_vk(VkBuffer bIn, size_t bytes_in,
         if (vkBindBufferMemory(g.dev, g.tbuf, g.tmem, 0) != VK_SUCCESS) return -1;
         g.tbuf_size = need;
     }
-    int rc = transpose_into(bIn, bytes_in, g.tbuf, need, K, N, ldin, ldout);
+    int rc = transpose_into(bIn, bytes_in, g.tbuf, need, K, N, ldin, ldout, batch, stride_in, stride_out);
     if (rc == 0) *out_vk = g.tbuf;
     return rc;
 }
 
-// 转置: HIP 指针版 (fp32 GEMM TB=0 场景)
+// 转置: HIP 指针版 (fp32 GEMM TB=0 场景); batch>1 时一次转置全部 batch (输出紧密串联)
 static int transpose_buf(const void* in, size_t bytes_in,
                          uint32_t K, uint32_t N, uint32_t ldin,
-                         VkBuffer* out_vk, uint32_t* ldout) {
+                         VkBuffer* out_vk, uint32_t* ldout,
+                         uint32_t batch, int64_t stride_in, int64_t stride_out) {
+    size_t bytes_all = bytes_in + (batch > 1 && stride_in > 0 ? (size_t)stride_in * (batch - 1) * 4 : 0);
     VkBuffer bIn; VkDeviceMemory mIn; VkDeviceSize oIn;
-    if (import_ptr(in, bytes_in, &bIn, &mIn, &oIn) != 0) return -1;
-    int rc = transpose_vk(bIn, bytes_in, K, N, ldin, out_vk, ldout);
+    if (import_ptr(in, bytes_all, &bIn, &mIn, &oIn) != 0) {
+        if (getenv("VKBLAS_TRACE")) fprintf(stderr, "[vk] merged: transpose import B failed ptr=%p size=%zu\n", in, bytes_all);
+        return -1;
+    }
+    int rc = transpose_vk(bIn, bytes_all, K, N, ldin, out_vk, ldout, batch, stride_in, stride_out);
     release_ptr(mIn, bIn);
     return rc;
 }
@@ -657,7 +670,8 @@ static int transpose_buf(const void* in, size_t bytes_in,
 // dtype: 0 = fp16, 1 = bf16
 static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t need,
                             uint32_t K, uint32_t N, uint32_t ldin,
-                            uint32_t* ldout, int dtype) {
+                            uint32_t* ldout, int dtype,
+                            uint32_t batch, int64_t stride_in, int64_t stride_out) {
     VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, need} };
     VkWriteDescriptorSet wds[2];
     for (int i = 0; i < 2; i++) {
@@ -669,7 +683,9 @@ static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t
 
     // Out 是 (N×K), 行步长 pad 偶 (K 奇时 +1, 保证行首 uint 对齐)
     uint32_t ldout_pad = K + (K & 1u);
-    struct { uint32_t R, C, ldin, ldout, roff; } pc = { K, N, ldin, ldout_pad, 0 };
+    // batch_base: RADV/gfx803 z>16 后 workgroup 调度串行, 拆批 z≤16
+    struct { uint32_t R, C, ldin, ldout, roff, batch, batch_base, stride_in, stride_out; } pc = {
+        K, N, ldin, ldout_pad, 0, 0, 0, (uint32_t)stride_in, (uint32_t)stride_out };
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(g.cmd, &cbbi);
@@ -678,11 +694,15 @@ static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t
     // 8MB/块分块 (2B 元素: 行字节 = N*2)
     const uint32_t ROWS_PER_DISP = (8u * 1024 * 1024) / (N * 2u);
     uint32_t rpd = ROWS_PER_DISP < 32 ? 32 : (ROWS_PER_DISP > 4096 ? 4096 : ROWS_PER_DISP);
-    for (uint32_t ro = 0; ro < K; ro += rpd) {
-        pc.roff = ro;
-        uint32_t rows = K - ro < rpd ? K - ro : rpd;
-        vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(g.cmd, (rows + 31) / 32, (N + 15) / 16, 1);
+    for (uint32_t bo = 0; bo < batch; bo += 16) {
+        pc.batch_base = bo;
+        pc.batch = batch - bo < 16 ? batch - bo : 16;
+        for (uint32_t ro = 0; ro < K; ro += rpd) {
+            pc.roff = ro;
+            uint32_t rows = K - ro < rpd ? K - ro : rpd;
+            vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(g.cmd, (rows + 31) / 32, (N + 15) / 16, pc.batch);
+        }
     }
     vkEndCommandBuffer(g.cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -697,8 +717,9 @@ static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t
 // 转置 (2B): 内部 buffer 池版
 static int transpose_h_vk(VkBuffer bIn, size_t bytes_in,
                           uint32_t K, uint32_t N, uint32_t ldin,
-                          VkBuffer* out_vk, uint32_t* ldout, int dtype) {
-    size_t need = (size_t)N * (K + (K & 1u)) * 2;
+                          VkBuffer* out_vk, uint32_t* ldout, int dtype,
+                          uint32_t batch, int64_t stride_in, int64_t stride_out) {
+    size_t need = (size_t)batch * N * (K + (K & 1u)) * 2;
     if (g.tbuf == VK_NULL_HANDLE || need > g.tbuf_size) {
         if (g.tbuf != VK_NULL_HANDLE) {
             vkFreeMemory(g.dev, g.tmem, NULL);
@@ -724,7 +745,8 @@ static int transpose_h_vk(VkBuffer bIn, size_t bytes_in,
         if (vkBindBufferMemory(g.dev, g.tbuf, g.tmem, 0) != VK_SUCCESS) return -1;
         g.tbuf_size = need;
     }
-    int rc = transpose_h_into(bIn, bytes_in, g.tbuf, need, K, N, ldin, ldout, dtype);
+    int rc = transpose_h_into(bIn, bytes_in, g.tbuf, need, K, N, ldin, ldout, dtype,
+                              batch, stride_in, stride_out);
     if (rc == 0) *out_vk = g.tbuf;
     return rc;
 }
@@ -734,6 +756,7 @@ static int run_gemm_h(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer b
                       VkBuffer bC, size_t bc,
                       uint32_t M, uint32_t N, uint32_t K,
                       uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                       float alpha, float beta) {
     if (g.pipe_h[dtype][variant] == VK_NULL_HANDLE) return -1;
     VkDescriptorBufferInfo db[3] = {
@@ -746,8 +769,10 @@ static int run_gemm_h(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer b
     }
     vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
 
-    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
-        M, N, K, (M + 63) / 64, (N + 63) / 64, (K + 31) / 32, lda, ldb, ldc, alpha, beta };
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 63) / 64, (N + 63) / 64, (K + 31) / 32, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
 
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -755,7 +780,7 @@ static int run_gemm_h(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer b
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_h[dtype][variant]);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     vkEndCommandBuffer(g.cmd);
 
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -770,6 +795,7 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
                          VkBuffer bC, size_t bc,
                          uint32_t M, uint32_t N, uint32_t K,
                          uint32_t lda, uint32_t ldb, uint32_t ldc,
+                         uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                          float alpha, float beta) {
     if (g.pipe128_h[dtype][variant] == VK_NULL_HANDLE) return -1;
     VkDescriptorBufferInfo db[3] = {
@@ -782,8 +808,10 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
     }
     vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
 
-    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
-        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc, alpha, beta };
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
 
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -791,7 +819,7 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128_h[dtype][variant]);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     vkEndCommandBuffer(g.cmd);
 
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -799,6 +827,59 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
     vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), "submit_h128");
     vkQueueWaitIdle(g.queue);
     return 0;
+}
+
+// 直通 batch 合并 (f16/bf16): 一次 import 全 batch + 一次转置 + 一次 dispatch (z=batch)
+// 要求 stride_c 偶 (写 C 对不变式: e = b*stride_c + row*ldc + cc 恒偶); 跨分配 → FALLBACK
+static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_op_t op_b,
+                                            uint32_t M, uint32_t N, uint32_t K,
+                                            float alpha,
+                                            const void* A, uint32_t lda,
+                                            const void* B, uint32_t ldb,
+                                            float beta,
+                                            void* C, uint32_t ldc,
+                                            uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    uint32_t Ra = (op_a == VKBLAS_OP_T) ? K : M;
+    uint32_t Ca = (op_a == VKBLAS_OP_T) ? M : K;
+    size_t ba_e = (size_t)(Ra - 1) * lda + Ca;
+    size_t bb_e, bc_e = (size_t)(M - 1) * ldc + N;
+    int variant;
+    if (op_b == VKBLAS_OP_N) { bb_e = (size_t)(K - 1) * ldb + N; variant = (int)op_a * 2 + 1; }
+    else                     { bb_e = (size_t)(N - 1) * ldb + K; variant = (int)op_a * 2 + (int)op_b; }
+    size_t ba_all = ba_e + (stride_a > 0 ? (size_t)stride_a * (batch - 1) : 0);   // 元素
+    size_t bb_all = bb_e + (stride_b > 0 ? (size_t)stride_b * (batch - 1) : 0);
+    size_t bc_all = bc_e + (stride_c > 0 ? (size_t)stride_c * (batch - 1) : 0);
+    VkBuffer bA, bB, bC; VkDeviceMemory mA, mB, mC; VkDeviceSize oA, oB, oC;
+    if (import_ptr(A, ba_all * 2, &bA, &mA, &oA) != 0) return VKBLAS_ERR_FALLBACK;
+    if (import_ptr(B, bb_all * 2, &bB, &mB, &oB) != 0) { release_ptr(mA, bA); return VKBLAS_ERR_FALLBACK; }
+    if (import_ptr(C, bc_all * 2, &bC, &mC, &oC) != 0) {
+        release_ptr(mA, bA); release_ptr(mB, bB); return VKBLAS_ERR_FALLBACK;
+    }
+    int rc = 0;
+    VkBuffer bBt = VK_NULL_HANDLE;
+    uint32_t ldb_eff = ldb;
+    int64_t sb_eff = stride_b;
+    if (op_b == VKBLAS_OP_N) {
+        // 一次转置全 batch: 输出紧密串联, 每 batch N×ldout (ldout = K pad 偶)
+        uint32_t ldout_pad = K + (K & 1u);
+        if (transpose_h_vk(bB, bb_all * 2, K, N, ldb, &bBt, &ldb_eff, dtype,
+                           batch, stride_b, (int64_t)N * ldout_pad) != 0) rc = VKBLAS_ERR_FALLBACK;
+        else { sb_eff = (int64_t)N * ldb_eff; }
+    }
+    if (rc == 0) {
+        size_t bb_used = bBt != VK_NULL_HANDLE ? (size_t)batch * N * ldb_eff * 2 : bb_all * 2;
+        VkBuffer bB_eff = bBt != VK_NULL_HANDLE ? bBt : bB;
+        if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256)
+            rc = run_gemm_h128(dtype, variant, bA, ba_all * 2, bB_eff, bb_used, bC, bc_all * 2,
+                               M, N, K, lda, ldb_eff, ldc,
+                               batch, stride_a, sb_eff, stride_c, alpha, beta);
+        else
+            rc = run_gemm_h(dtype, variant, bA, ba_all * 2, bB_eff, bb_used, bC, bc_all * 2,
+                            M, N, K, lda, ldb_eff, ldc,
+                            batch, stride_a, sb_eff, stride_c, alpha, beta);
+    }
+    release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+    return rc != 0 ? VKBLAS_ERR_FALLBACK : VKBLAS_OK;
 }
 
 // 直通 GEMM 主路径 (f16/bf16, llama.cpp mul_mm 思路): 2B 半精度 A/B/C 直接进 shader
@@ -829,6 +910,35 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
 
     const char* pa = (const char*)A, *pb = (const char*)B, *pc = (const char*)C;
     int trace = getenv("VKBLAS_TRACE") != NULL;
+
+    // ---- batch>1 合并快路径: 一次 import + 一次 dispatch (z=batch) ----
+    // 条件: stride 全 ≥0 且 stride_c 偶 (直通写 C 对不变式: e 恒偶)
+    // RADV/gfx803 实测: 单次 dispatch 的 batch 维 >16 后 workgroup 调度退化为串行 (与轴无关)
+    // → 拆批 ≤16 (每批独立指针偏移, stride 不变)
+    if (batch > 1 && stride_a >= 0 && stride_b >= 0 && stride_c >= 0 && (stride_c & 1) == 0) {
+        uint32_t rem = batch;
+        const char* pa2 = pa, *pb2 = pb, *pc2 = pc;
+        int rc = 0, fallback = 0;
+        while (rem > 0) {
+            uint32_t nb = rem > 16 ? 16 : rem;
+            rc = gemm_h_direct_merged(dtype, op_a, op_b, M, N, K,
+                                      alpha, pa2, lda, pb2, ldb, beta, pc2, ldc,
+                                      nb, stride_a, stride_b, stride_c);
+            if (rc == VKBLAS_OK) {
+                pa2 += (int64_t)nb * stride_a * 2;
+                pb2 += (int64_t)nb * stride_b * 2;
+                pc2 += (int64_t)nb * stride_c * 2;
+                rem -= nb;
+            } else {
+                fallback = 1;
+                break;
+            }
+        }
+        if (!fallback) return VKBLAS_OK;
+        if (rc != VKBLAS_ERR_FALLBACK) return rc;
+        // FALLBACK → 落回逐 batch 循环
+    }
+
     for (uint32_t i = 0; i < batch; i++) {
         VkBuffer bA, bB, bC; VkDeviceMemory mA, mB, mC; VkDeviceSize oA, oB, oC;
         if (import_ptr(pa, ba_e * 2, &bA, &mA, &oA) != 0) return VKBLAS_ERR_IMPORT;
@@ -840,7 +950,7 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
         uint32_t ldb_eff = ldb;
         if (op_b == VKBLAS_OP_N) {
             // B (K×N) → 转置 (N×K), 行步长 pad 偶 → TB=1 快路径
-            if (transpose_h_vk(bB, bb_e * 2, K, N, ldb, &bBt, &ldb_eff, dtype) != 0) rc = -1;
+            if (transpose_h_vk(bB, bb_e * 2, K, N, ldb, &bBt, &ldb_eff, dtype, 1, 0, 0) != 0) rc = -1;
         }
         if (rc == 0) {
             size_t bb_used = bb_e * 2;
@@ -848,10 +958,12 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
             VkBuffer bB_eff = bBt != VK_NULL_HANDLE ? bBt : bB;
             if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256)
                 rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB_eff,
-                                   bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc, alpha, beta);
+                                   bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc,
+                                   1, 0, 0, 0, alpha, beta);
             else
                 rc = run_gemm_h(dtype, variant, bA, ba_e * 2, bB_eff,
-                                bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc, alpha, beta);
+                                bb_used, bC, bc_e * 2, M, N, K, lda, ldb_eff, ldc,
+                                1, 0, 0, 0, alpha, beta);
         }
         release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
         if (trace)
@@ -867,6 +979,7 @@ static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t 
                        VkBuffer bC, size_t bc,
                        uint32_t M, uint32_t N, uint32_t K,
                        uint32_t lda, uint32_t ldb, uint32_t ldc,
+                       uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                        float alpha, float beta) {
     VkDescriptorBufferInfo db[3] = {
         {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
@@ -878,8 +991,10 @@ static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t 
     }
     vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
 
-    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
-        M, N, K, (M + 63) / 64, (N + 63) / 64, (K + 31) / 32, lda, ldb, ldc, alpha, beta };
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 63) / 64, (N + 63) / 64, (K + 31) / 32, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
 
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -887,7 +1002,7 @@ static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t 
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe[variant]);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     vkEndCommandBuffer(g.cmd);
 
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -902,6 +1017,7 @@ static int run_gemm_vk128(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size
                           VkBuffer bC, size_t bc,
                           uint32_t M, uint32_t N, uint32_t K,
                           uint32_t lda, uint32_t ldb, uint32_t ldc,
+                          uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                           float alpha, float beta) {
     if (g.pipe128[variant] == VK_NULL_HANDLE) return -1;
     VkDescriptorBufferInfo db[3] = {
@@ -914,8 +1030,10 @@ static int run_gemm_vk128(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size
     }
     vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
 
-    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc; float alpha, beta; } pc = {
-        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc, alpha, beta };
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
 
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -923,7 +1041,7 @@ static int run_gemm_vk128(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128[variant]);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(g.cmd, pc.Mt, pc.Nt, 1);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     vkEndCommandBuffer(g.cmd);
 
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1040,22 +1158,30 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
                     size_t ba, size_t bb, size_t bc,
                     uint32_t M, uint32_t N, uint32_t K,
                     uint32_t lda, uint32_t ldb, uint32_t ldc,
+                    uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                     float alpha, float beta) {
     VkBuffer bA, bB, bC;
     VkDeviceMemory mA, mB, mC;
     VkDeviceSize oA, oB, oC;
     int bB_imported = 0;
-    if (import_ptr(A, ba, &bA, &mA, &oA) != 0) return -1;
+    // batch>1 合并: import 覆盖全 batch (stride>0 才扩展; stride=0 = 广播, 单份即可)
+    // 注意: 调用方传 ba/bb/bc 为单 batch 范围, 这里按 batch 扩展;
+    //       bB_opt (转置产物) 时 bb 已是全 batch 范围, 不再扩展
+    size_t ba_all = ba + (batch > 1 && stride_a > 0 ? (size_t)stride_a * (batch - 1) * 4 : 0);
+    size_t bb_all = (bB_opt != VK_NULL_HANDLE) ? bb
+                  : bb + (batch > 1 && stride_b > 0 ? (size_t)stride_b * (batch - 1) * 4 : 0);
+    size_t bc_all = bc + (batch > 1 && stride_c > 0 ? (size_t)stride_c * (batch - 1) * 4 : 0);
+    if (import_ptr(A, ba_all, &bA, &mA, &oA) != 0) return -1;
     if (bB_opt != VK_NULL_HANDLE) {
         bB = bB_opt; mB = VK_NULL_HANDLE; oB = 0;  // 转置产物, 直接复用
     } else {
-        if (import_ptr(B, bb, &bB, &mB, &oB) != 0) {
+        if (import_ptr(B, bb_all, &bB, &mB, &oB) != 0) {
             release_ptr(mA, bA);
             return -1;
         }
         bB_imported = 1;
     }
-    if (import_ptr(C, bc, &bC, &mC, &oC) != 0) {
+    if (import_ptr(C, bc_all, &bC, &mC, &oC) != 0) {
         release_ptr(mA, bA);
         if (bB_imported) release_ptr(mB, bB);
         return -1;
@@ -1071,7 +1197,8 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
     int rc = -1;
     uint32_t Mt = use128 ? (M + 127) / 128 : (M + 63) / 64;
     uint32_t Nt = use128 ? (N + 127) / 128 : (N + 63) / 64;
-    if (K >= 2048 && Mt * Nt <= 18 && (use128 ? g.pipe_sk128[0] : g.pipe_sk[0]) != VK_NULL_HANDLE &&
+    if (batch == 1 && K >= 2048 && Mt * Nt <= 18 &&
+        (use128 ? g.pipe_sk128[0] : g.pipe_sk[0]) != VK_NULL_HANDLE &&
         getenv("VKBLAS_NOSPLITK") == NULL) {
         uint32_t split_k = 36 / (Mt * Nt);
         if (split_k > 8) split_k = 8;
@@ -1083,9 +1210,11 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
     }
     if (rc != 0) {
         if (use128)
-            rc = run_gemm_vk128(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
+            rc = run_gemm_vk128(variant, bA, ba_all, bB, bb_all, bC, bc_all,
+                                M, N, K, lda, ldb, ldc, batch, stride_a, stride_b, stride_c, alpha, beta);
         else
-            rc = run_gemm_vk(variant, bA, ba, bB, bb, bC, bc, M, N, K, lda, ldb, ldc, alpha, beta);
+            rc = run_gemm_vk(variant, bA, ba_all, bB, bb_all, bC, bc_all,
+                             M, N, K, lda, ldb, ldc, batch, stride_a, stride_b, stride_c, alpha, beta);
     }
 
     release_ptr(mA, bA);
@@ -1193,6 +1322,56 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+// ---- batch 合并快路径 (llama.cpp mul_mm 思路: z 轴一次 dispatch 全 batch) ----
+// 一次 import 全 batch (跨 hipMalloc 分配时 hsa 导出失败 → FALLBACK 回退逐 batch 循环)
+// 返回: VKBLAS_OK 成功 / VKBLAS_ERR_FALLBACK 不可合并 (调用方回退循环) / 其他错误
+static int gemm_f32_merged(int variant, vkblas_op_t op_b,
+                           const char* pa, const char* pb, const char* pc,
+                           size_t ba, size_t bb, size_t bc,
+                           uint32_t M, uint32_t N, uint32_t K,
+                           uint32_t lda, uint32_t ldb, uint32_t ldc,
+                           uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                           float alpha, float beta) {
+    // stride>0 扩展覆盖全 batch; stride=0 = 广播语义 (全 batch 读同一份)
+    size_t ba_all = ba + (stride_a > 0 ? (size_t)stride_a * (batch - 1) * 4 : 0);
+    size_t bb_all = bb + (stride_b > 0 ? (size_t)stride_b * (batch - 1) * 4 : 0);
+    size_t bc_all = bc + (stride_c > 0 ? (size_t)stride_c * (batch - 1) * 4 : 0);
+    VkBuffer bA, bC; VkDeviceMemory mA, mC; VkDeviceSize oA, oC;
+    if (import_ptr(pa, ba_all, &bA, &mA, &oA) != 0) {
+        if (getenv("VKBLAS_TRACE")) fprintf(stderr, "[vk] merged: import A failed (fallback loop) ptr=%p size=%zu\n", pa, ba_all);
+        return VKBLAS_ERR_FALLBACK;
+    }
+    if (import_ptr(pc, bc_all, &bC, &mC, &oC) != 0) {
+        release_ptr(mA, bA);
+        if (getenv("VKBLAS_TRACE")) fprintf(stderr, "[vk] merged: import C failed (fallback loop) ptr=%p size=%zu\n", pc, bc_all);
+        return VKBLAS_ERR_FALLBACK;
+    }
+    if (getenv("VKBLAS_TRACE")) fprintf(stderr, "[vk] merged: batch=%u dispatch (M%u N%u K%u)\n", batch, M, N, K);
+    int rc = 0;
+    if (op_b == VKBLAS_OP_N && g.tpipe != VK_NULL_HANDLE) {
+        // B (K×N) → 一次转置全部 batch, 输出紧密串联 (每 batch N×K, 行步长 K)
+        // 注意: transpose_buf 内部按 stride 扩展 import 范围, 这里传单 batch 大小
+        VkBuffer bBt; uint32_t ldb_t;
+        if (transpose_buf(pb, bb, K, N, ldb, &bBt, &ldb_t,
+                          batch, stride_b, (int64_t)N * K) != 0) {
+            rc = VKBLAS_ERR_FALLBACK; goto out;
+        }
+        size_t bb_arg = (size_t)batch * N * ldb_t * 4;   // 转置输出全 batch 范围 (descriptor)
+        rc = run_gemm(variant ^ 1, pa, bBt, NULL, pc, ba, bb_arg, bc,
+                      M, N, K, lda, ldb_t, ldc,
+                      batch, stride_a, (int64_t)N * ldb_t, stride_c, alpha, beta);
+    } else {
+        rc = run_gemm(variant, pa, VK_NULL_HANDLE, pb, pc, ba, bb, bc,
+                      M, N, K, lda, ldb, ldc,
+                      batch, stride_a, stride_b, stride_c, alpha, beta);
+    }
+    if (rc != 0) rc = VKBLAS_ERR_FALLBACK;
+out:
+    release_ptr(mA, bA);
+    release_ptr(mC, bC);
+    return rc;
+}
+
 vkblas_status_t vkblas_gemm_f32(
     vkblas_op_t op_a, vkblas_op_t op_b,
     uint32_t M, uint32_t N, uint32_t K,
@@ -1220,26 +1399,54 @@ vkblas_status_t vkblas_gemm_f32(
     ba *= 4; bb *= 4; bc *= 4;
     int variant = (int)op_a * 2 + (int)op_b;
     const char* pa = (const char*)A, *pb = (const char*)B, *pc = (const char*)C;
+
+    // ---- batch>1 合并快路径: 一次 import + 一次 dispatch (z=batch), 省 (batch-1) 次固定开销 ----
+    // RADV/gfx803 实测: 单次 dispatch 的 batch 维 >16 后 workgroup 调度退化为串行 (与轴无关)
+    // → 拆批 ≤16 (每批独立指针偏移, stride 不变, shader 零改动)
+    if (batch > 1 && stride_a >= 0 && stride_b >= 0 && stride_c >= 0) {
+        uint32_t rem = batch;
+        const char* pa2 = pa, *pb2 = pb, *pc2 = pc;
+        int rc = 0, fallback = 0;
+        while (rem > 0) {
+            uint32_t nb = rem > 16 ? 16 : rem;
+            rc = gemm_f32_merged(variant, op_b, pa2, pb2, pc2, ba, bb, bc,
+                                 M, N, K, lda, ldb, ldc,
+                                 nb, stride_a, stride_b, stride_c, alpha, beta);
+            if (rc == VKBLAS_OK) {
+                pa2 += (int64_t)nb * stride_a * 4;
+                pb2 += (int64_t)nb * stride_b * 4;
+                pc2 += (int64_t)nb * stride_c * 4;
+                rem -= nb;
+            } else {
+                fallback = 1;
+                break;
+            }
+        }
+        if (!fallback) { pthread_mutex_unlock(&g.lock); return VKBLAS_OK; }
+        if (rc != VKBLAS_ERR_FALLBACK) { pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
+        // FALLBACK → 落回逐 batch 循环
+    }
+
     for (uint32_t i = 0; i < batch; i++) {
         if (op_b == VKBLAS_OP_N && g.tpipe != VK_NULL_HANDLE) {
             // B 是行优先 (K×N, 行步长 ldb) → 转置成 (N×K) 紧密, 走 TB=1 快路径
             // (gfx803/RADV 上行优先 B 直接读慢 ~9x)
             VkBuffer bBt;
             uint32_t ldb_t;
-            if (transpose_buf(pb, bb, K, N, ldb, &bBt, &ldb_t) != 0) {
+            if (transpose_buf(pb, bb, K, N, ldb, &bBt, &ldb_t, 1, 0, 0) != 0) {
                 pthread_mutex_unlock(&g.lock);
                 return VKBLAS_ERR_IMPORT;
             }
             size_t bb_t = (size_t)(N - 1) * ldb_t + K;  // TB=1 转置读范围
             bb_t *= 4;
             if (run_gemm(variant ^ 1, pa, bBt, NULL, pc, ba, bb_t, bc,
-                         M, N, K, lda, ldb_t, ldc, alpha, beta) != 0) {
+                         M, N, K, lda, ldb_t, ldc, 1, 0, 0, 0, alpha, beta) != 0) {
                 pthread_mutex_unlock(&g.lock);
                 return VKBLAS_ERR_IMPORT;
             }
         } else {
             if (run_gemm(variant, pa, VK_NULL_HANDLE, pb, pc, ba, bb, bc,
-                         M, N, K, lda, ldb, ldc, alpha, beta) != 0) {
+                         M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta) != 0) {
                 pthread_mutex_unlock(&g.lock);
                 return VKBLAS_ERR_IMPORT;
             }
@@ -1325,7 +1532,7 @@ vkblas_status_t vkblas_gemm_bf16(
         uint32_t ldb_eff = ldb;
         if (op_b == VKBLAS_OP_N) {
             // ibuf[1] 是 (K×N, ldb) → 转置成 (N×K) 紧密, 走 TB=1
-            if (transpose_vk(g.ibuf[1], bb2, K, N, ldb, &bBt, &ldb_eff) != 0) rc = -1;
+            if (transpose_vk(g.ibuf[1], bb2, K, N, ldb, &bBt, &ldb_eff, 1, 0, 0) != 0) rc = -1;
         }
         uint64_t t3 = trace ? now_us() : 0;
         // C: beta!=0 时读入 fp32; beta==0 时 ibuf[2] 无需初始化 (GEMM 覆盖写)
@@ -1344,7 +1551,7 @@ vkblas_status_t vkblas_gemm_bf16(
         }
         rc = run_gemm_vk(variant, g.ibuf[0], ba2, bBt != VK_NULL_HANDLE ? bBt : g.ibuf[1],
                          bb2_used, g.ibuf[2], bc2,
-                         M, N, K, lda, ldb_eff, ldc, alpha, beta);
+                         M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, alpha, beta);
         uint64_t t4 = trace ? now_us() : 0;
         // 回写: fp32 → bf16 (ldc 偶数走列对快路径, 奇数走原子变体; 原子路径由 cvt_run 内部先清零)
         if (rc == 0)
@@ -1440,7 +1647,7 @@ vkblas_status_t vkblas_gemm_f16(
         uint32_t ldb_eff = ldb;
         if (op_b == VKBLAS_OP_N) {
             // ibuf[1] 是 (K×N, ldb) → 转置成 (N×K) 紧密, 走 TB=1
-            if (transpose_vk(g.ibuf[1], bb2, K, N, ldb, &bBt, &ldb_eff) != 0) rc = -1;
+            if (transpose_vk(g.ibuf[1], bb2, K, N, ldb, &bBt, &ldb_eff, 1, 0, 0) != 0) rc = -1;
         }
         uint64_t t3 = trace ? now_us() : 0;
         // C: beta!=0 时读入 fp32; beta==0 时 ibuf[2] 无需初始化 (GEMM 覆盖写)
@@ -1459,7 +1666,7 @@ vkblas_status_t vkblas_gemm_f16(
         }
         rc = run_gemm_vk(variant, g.ibuf[0], ba2, bBt != VK_NULL_HANDLE ? bBt : g.ibuf[1],
                          bb2_used, g.ibuf[2], bc2,
-                         M, N, K, lda, ldb_eff, ldc, alpha, beta);
+                         M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, alpha, beta);
         uint64_t t4 = trace ? now_us() : 0;
         // 回写: fp32 → fp16 (ldc 偶数走列对快路径, 奇数走原子变体; 原子路径由 cvt_run 内部先清零)
         if (rc == 0)
@@ -1629,8 +1836,8 @@ int vkblas_gemm_c64(
         VkBuffer bBr = g.ibuf[2], bBi = g.ibuf[3];
         if (op_b == VKBLAS_OP_N) {
             // Br/Bi → BrT/BiT (N×K 紧密)
-            rc |= transpose_into(g.ibuf[2], bb_p, g.ibuf[4], bt_p, K, N, ldb, &ldb_eff);
-            rc |= transpose_into(g.ibuf[3], bb_p, g.ibuf[5], bt_p, K, N, ldb, &ldb_eff);
+            rc |= transpose_into(g.ibuf[2], bb_p, g.ibuf[4], bt_p, K, N, ldb, &ldb_eff, 1, 0, 0);
+            rc |= transpose_into(g.ibuf[3], bb_p, g.ibuf[5], bt_p, K, N, ldb, &ldb_eff, 1, 0, 0);
             bBr = g.ibuf[4]; bBi = g.ibuf[5];
         }
         if (rc != 0) { release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
@@ -1639,13 +1846,13 @@ int vkblas_gemm_c64(
         // 4 次 fp32 GEMM (beta 项在 combine 处理, 这里全用 beta=0 或累加)
         // T1 = ArBr; T1 -= AiBi; T2 = ArBi; T2 += AiBr
         rc |= run_gemm_vk(variant, g.ibuf[0], ba_p, bBr, bt_p ? bt_p : bb_p,
-                          g.ibuf[6], bc_p, M, N, K, lda, ldb_eff, ldc, 1.0f, 0.0f);
+                          g.ibuf[6], bc_p, M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, 1.0f, 0.0f);
         rc |= run_gemm_vk(variant, g.ibuf[1], ba_p, bBi, bt_p ? bt_p : bb_p,
-                          g.ibuf[6], bc_p, M, N, K, lda, ldb_eff, ldc, -1.0f, 1.0f);
+                          g.ibuf[6], bc_p, M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, -1.0f, 1.0f);
         rc |= run_gemm_vk(variant, g.ibuf[0], ba_p, bBi, bt_p ? bt_p : bb_p,
-                          g.ibuf[7], bc_p, M, N, K, lda, ldb_eff, ldc, 1.0f, 0.0f);
+                          g.ibuf[7], bc_p, M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, 1.0f, 0.0f);
         rc |= run_gemm_vk(variant, g.ibuf[1], ba_p, bBr, bt_p ? bt_p : bb_p,
-                          g.ibuf[7], bc_p, M, N, K, lda, ldb_eff, ldc, 1.0f, 1.0f);
+                          g.ibuf[7], bc_p, M, N, K, lda, ldb_eff, ldc, 1, 0, 0, 0, 1.0f, 1.0f);
         // combine: C = alpha·(T1+iT2) + beta·C_old (读 bC 旧值, 写回 bC)
         if (rc == 0)
             rc = cx_combine(g.ibuf[6], bc_p, g.ibuf[7], bc_p, bC, bc_e * 8, bC, bc_e * 8,

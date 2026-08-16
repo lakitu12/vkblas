@@ -13,6 +13,7 @@ layout(push_constant) uniform Params {
     uint M, N, K;
     uint Mt, Nt, Kt;
     uint lda, ldb, ldc;
+    uint batch_stride_a, batch_stride_b, batch_stride_c;
     float alpha, beta;
 } p;
 
@@ -78,10 +79,14 @@ void write1(uint e, float v) {
 
 void load_tile(uint kt) {
     uint base_k = kt * 32;
-    uint base_m = gl_WorkGroupID.x * 64;
+    uint b = gl_WorkGroupID.x / p.Mt;                 // batch 索引 (x 轴: z>16 串行, x 无限制)
+    uint tgx = gl_WorkGroupID.x % p.Mt;
+    uint base_m = tgx * 64;
     uint base_n = gl_WorkGroupID.y * 64;
     uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
     uint tid = ly * 16 + lx;
+    uint aoff = b * p.batch_stride_a;                 // batch 元素偏移
+    uint boff = b * p.batch_stride_b;
 
     // A: 64×32 tile, 每线程 4 行(m) × 2 列(k)
     uint a_row4 = (tid >> 4) * 4;
@@ -92,13 +97,13 @@ void load_tile(uint kt) {
         uint ak = base_k + a_col2 + c;
         uint am = base_m + a_row4;
         if (ak < p.K && am + 3 < p.M) {
-            vec4 v = load4(ak * p.lda + am, 0);
+            vec4 v = load4(aoff + ak * p.lda + am, 0);
             As[a_col2 + c][a_row4 + 0] = v.x; As[a_col2 + c][a_row4 + 1] = v.y;
             As[a_col2 + c][a_row4 + 2] = v.z; As[a_col2 + c][a_row4 + 3] = v.w;
         } else {
             for (int i = 0; i < 4; i++) {
                 uint mm = am + uint(i);
-                As[a_col2 + c][a_row4 + i] = (ak < p.K && mm < p.M) ? load1(ak * p.lda + mm, 0) : 0.0;
+                As[a_col2 + c][a_row4 + i] = (ak < p.K && mm < p.M) ? load1(aoff + ak * p.lda + mm, 0) : 0.0;
             }
         }
     }
@@ -108,12 +113,12 @@ void load_tile(uint kt) {
         uint am = base_m + a_row4 + r;
         uint ak = base_k + a_col2;
         if (am < p.M && ak + 1 < p.K) {
-            vec2 v = load2(am * p.lda + ak, 0);
+            vec2 v = load2(aoff + am * p.lda + ak, 0);
             As[a_col2 + 0][a_row4 + r] = v.x; As[a_col2 + 1][a_row4 + r] = v.y;
         } else {
             for (int c = 0; c < 2; c++) {
                 uint kk = ak + uint(c);
-                As[a_col2 + c][a_row4 + r] = (am < p.M && kk < p.K) ? load1(am * p.lda + kk, 0) : 0.0;
+                As[a_col2 + c][a_row4 + r] = (am < p.M && kk < p.K) ? load1(aoff + am * p.lda + kk, 0) : 0.0;
             }
         }
     }
@@ -128,12 +133,12 @@ void load_tile(uint kt) {
         uint n = base_n + b_col4 + r;
         uint krow = base_k + b_row2;
         if (n < p.N && krow + 1 < p.K) {
-            vec2 v = load2(n * p.ldb + krow, 1);
+            vec2 v = load2(boff + n * p.ldb + krow, 1);
             Bs[b_row2][b_col4 + r] = v.x;
             Bs[b_row2 + 1][b_col4 + r] = v.y;
         } else {
-            Bs[b_row2][b_col4 + r] = (n < p.N && krow < p.K) ? load1(n * p.ldb + krow, 1) : 0.0;
-            Bs[b_row2 + 1][b_col4 + r] = (n < p.N && krow + 1 < p.K) ? load1(n * p.ldb + krow + 1, 1) : 0.0;
+            Bs[b_row2][b_col4 + r] = (n < p.N && krow < p.K) ? load1(boff + n * p.ldb + krow, 1) : 0.0;
+            Bs[b_row2 + 1][b_col4 + r] = (n < p.N && krow + 1 < p.K) ? load1(boff + n * p.ldb + krow + 1, 1) : 0.0;
         }
     }
 #else
@@ -142,13 +147,13 @@ void load_tile(uint kt) {
         uint krow = base_k + b_row2 + r;
         uint n = base_n + b_col4;
         if (krow < p.K && n + 3 < p.N) {
-            vec4 v = load4(krow * p.ldb + n, 1);
+            vec4 v = load4(boff + krow * p.ldb + n, 1);
             Bs[b_row2 + r][b_col4 + 0] = v.x; Bs[b_row2 + r][b_col4 + 1] = v.y;
             Bs[b_row2 + r][b_col4 + 2] = v.z; Bs[b_row2 + r][b_col4 + 3] = v.w;
         } else {
             for (int c = 0; c < 4; c++) {
                 uint nn = n + uint(c);
-                Bs[b_row2 + r][b_col4 + c] = (krow < p.K && nn < p.N) ? load1(krow * p.ldb + nn, 1) : 0.0;
+                Bs[b_row2 + r][b_col4 + c] = (krow < p.K && nn < p.N) ? load1(boff + krow * p.ldb + nn, 1) : 0.0;
             }
         }
     }
@@ -156,7 +161,9 @@ void load_tile(uint kt) {
 }
 
 void main() {
-    uint tgx = gl_WorkGroupID.x, tgy = gl_WorkGroupID.y;
+    uint tgx = gl_WorkGroupID.x % p.Mt;              // tile m (batch 已并入 x 轴)
+    uint b = gl_WorkGroupID.x / p.Mt;
+    uint tgy = gl_WorkGroupID.y;
     uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
     uint base_m = tgx * 64, base_n = tgy * 64;
 
@@ -191,6 +198,7 @@ void main() {
     }
 
     // 写 C: 每线程 4 行 × 4 列; ldc 偶 + N 偶 (host 保证) → 每 2 元素 1 uint 直接写
+    uint coff = b * p.batch_stride_c;
     for (int i = 0; i < 4; i++) {
         uint row = base_m + ly * 4 + i;
         if (row >= p.M) continue;
@@ -200,7 +208,7 @@ void main() {
             uint cc = col + uint(j);
             // 直通条件 N 偶: 越界列 (cc >= N) 直接跳过; 行尾单元素 (cc+1 >= N) 仅 N 奇, 不达
             if (cc + 1 >= p.N) continue;
-            uint e = row * p.ldc + cc;
+            uint e = coff + row * p.ldc + cc;
             float c0, c1;
             if (p.beta != 0.0) {
                 vec2 old = hx2(C[e >> 1]);

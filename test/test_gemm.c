@@ -16,6 +16,10 @@ typedef hipblasStatus_t (*sgemm_fn)(hipblasHandle_t, hipblasOperation_t, hipblas
                                     const float*, int64_t, const float*, float*, int64_t);
 typedef hipblasStatus_t (*create_fn)(hipblasHandle_t*);
 typedef hipblasStatus_t (*destroy_fn)(hipblasHandle_t);
+typedef hipblasStatus_t (*sgemm_batch_fn)(hipblasHandle_t, hipblasOperation_t, hipblasOperation_t,
+                                          int64_t, int64_t, int64_t, const float*, const float*, int64_t,
+                                          int64_t, const float*, int64_t, int64_t, const float*,
+                                          float*, int64_t, int64_t, int64_t);
 
 static double now_s(void) {
     struct timespec ts;
@@ -121,6 +125,85 @@ static int run_case(sgemm_fn vk_sgemm, create_fn vk_create, destroy_fn vk_destro
     return ok ? 0 : 1;
 }
 
+// ---- strided_batched 多 batch 测试: 单次 hipblasSgemmStridedBatched vs CPU 逐 batch 参照 ----
+static int run_batch_case(sgemm_batch_fn vk_sgemm_batch, create_fn vk_create, destroy_fn vk_destroy,
+                          const char* name,
+                          hipblasOperation_t transa, hipblasOperation_t transb,
+                          int m, int n, int k, int lda, int ldb, int ldc,
+                          int64_t strideA, int64_t strideB, int64_t strideC, int batch,
+                          float alpha, float beta, int seed) {
+    // 单 batch 尺寸 (元素) + 全 batch 总大小
+    size_t szA1 = (transa == HIPBLAS_OP_T) ? (size_t)lda * m : (size_t)lda * k;
+    size_t szB1 = (transb == HIPBLAS_OP_T) ? (size_t)ldb * k : (size_t)ldb * n;
+    size_t szC1 = (size_t)ldc * n;
+    size_t szA = (strideA > 0 ? (size_t)strideA * (batch - 1) : 0) + szA1;
+    size_t szB = (strideB > 0 ? (size_t)strideB * (batch - 1) : 0) + szB1;
+    size_t szC = (strideC > 0 ? (size_t)strideC * (batch - 1) : 0) + szC1;
+    float *hA = malloc(szA * 4), *hB = malloc(szB * 4), *hC = malloc(szC * 4);
+    float *hRef = malloc(szC * 4), *hGot = malloc(szC * 4);
+    srand(seed);
+    for (size_t i = 0; i < szA; i++) hA[i] = (float)(rand() % 200 - 100) / 10.0f;
+    for (size_t i = 0; i < szB; i++) hB[i] = (float)(rand() % 200 - 100) / 10.0f;
+    for (size_t i = 0; i < szC; i++) hC[i] = (float)(rand() % 200 - 100) / 10.0f;
+    memcpy(hRef, hC, szC * 4);
+    memcpy(hGot, hC, szC * 4);
+
+    // CPU 参照: 逐 batch 调 ref_gemm (stride 为 0 时广播 = 所有 batch 共享同一份)
+    int sample = ((int64_t)m * n * k > 5000000) ? 12 : 0;
+    for (int b = 0; b < batch; b++) {
+        const float* Ab = hA + (strideA > 0 ? strideA * b : 0);
+        const float* Bb = hB + (strideB > 0 ? strideB * b : 0);
+        float* Cb = hRef + (strideC > 0 ? strideC * b : 0);
+        ref_gemm(transa, transb, m, n, k, alpha, Ab, lda, Bb, ldb, beta, Cb, ldc, sample);
+    }
+
+    float *dA, *dB, *dC2;
+    hipMalloc((void**)&dA, szA * 4); hipMalloc((void**)&dB, szB * 4);
+    hipMalloc((void**)&dC2, szC * 4);
+    hipMemcpy(dA, hA, szA * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dB, hB, szB * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dC2, hGot, szC * 4, hipMemcpyHostToDevice);
+
+    hipblasHandle_t vh;
+    vk_create(&vh);
+    hipblasStatus_t st2 = vk_sgemm_batch(vh, transa, transb, m, n, k,
+                                         &alpha, dA, lda, strideA, dB, ldb, strideB,
+                                         &beta, dC2, ldc, strideC, batch);
+    hipDeviceSynchronize();
+    vk_destroy(vh);
+
+    hipMemcpy(hGot, dC2, szC * 4, hipMemcpyDeviceToHost);
+
+    double maxd = 0;
+    if (sample > 0) {
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < sample; r++) {
+                int i = (int)((int64_t)r * m / sample);
+                if (r == sample - 1) i = m - 1;
+                for (int j = 0; j < n; j++) {
+                    size_t off = (strideC > 0 ? strideC * b : 0) + i + (size_t)j * ldc;
+                    double d = fabs((double)hRef[off] - hGot[off]);
+                    if (d > maxd) maxd = d;
+                }
+            }
+        }
+    } else {
+        for (size_t i = 0; i < szC; i++) {
+            double d = fabs((double)hRef[i] - hGot[i]);
+            if (d > maxd) maxd = d;
+        }
+    }
+    int ok = (st2 == HIPBLAS_STATUS_SUCCESS && maxd < 0.1);
+    printf("BATCH %-32s M=%-4d N=%-4d K=%-4d b=%-3d | vk=%s | maxdiff=%.2e | %s\n",
+           name, m, n, k, batch,
+           st2 == HIPBLAS_STATUS_SUCCESS ? "ok" : "ERR",
+           maxd, ok ? "PASS" : "FAIL");
+
+    free(hA); free(hB); free(hC); free(hRef); free(hGot);
+    hipFree(dA); hipFree(dB); hipFree(dC2);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     int perf = argc > 1 && strcmp(argv[1], "--perf") == 0;
 
@@ -129,7 +212,8 @@ int main(int argc, char** argv) {
     sgemm_fn vk_sgemm = (sgemm_fn)dlsym(so, "hipblasSgemm");
     create_fn vk_create = (create_fn)dlsym(so, "hipblasCreate");
     destroy_fn vk_destroy = (destroy_fn)dlsym(so, "hipblasDestroy");
-    if (!vk_sgemm || !vk_create || !vk_destroy) {
+    sgemm_batch_fn vk_sgemm_batch = (sgemm_batch_fn)dlsym(so, "hipblasSgemmStridedBatched");
+    if (!vk_sgemm || !vk_create || !vk_destroy || !vk_sgemm_batch) {
         fprintf(stderr, "dlsym hipblas symbols failed\n");
         return 2;
     }
@@ -169,6 +253,43 @@ int main(int argc, char** argv) {
                           128, 64, 64, 140, 80, 300, 1.0f, 0.0f, 8);
         fails += run_case(vk_sgemm, vk_create, vk_destroy, "padded both T", HIPBLAS_OP_T, HIPBLAS_OP_T,
                           100, 50, 80, 120, 90, 150, 1.0f, 1.0f, 9);
+
+        // ---- strided_batched 多 batch (batch 合并快路径) ----
+        // 变体覆盖: NN (转置合并) / TT (直接合并) / 非 128 倍数 (v6) / 256+ (v7-128)
+        // alpha/beta / 非紧密 stride / 广播 stride=0
+        hipblasOperation_t ops2[2] = { HIPBLAS_OP_N, HIPBLAS_OP_T };
+        struct { int m, n, k, lda, ldb, ldc; int64_t sa, sb, sc; int batch; } bshapes[] = {
+            {64, 64, 64, 64, 64, 64, 4096, 4096, 4096, 8},      // NN/TT 紧密
+            {128, 128, 128, 128, 128, 128, 16384, 16384, 16384, 6},  // v7-128 边界
+            {256, 256, 256, 256, 256, 256, 65536, 65536, 65536, 4},  // v7-128
+            {33, 65, 17, 40, 70, 40, 2800, 1190, 2600, 5},      // 奇数+padding, v6 (strideC=ldc*n)
+            {100, 200, 300, 320, 310, 110, 32000, 62000, 22000, 3},  // 大 K, 非紧密 stride (lda≥K 320/310)
+        };
+        for (int s = 0; s < (int)(sizeof(bshapes) / sizeof(bshapes[0])); s++) {
+            for (int ta = 0; ta < 2; ta++) {
+                for (int tb = 0; tb < 2; tb++) {
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "%s%s %dx%dx%d", ta ? "T" : "N", tb ? "T" : "N",
+                             bshapes[s].m, bshapes[s].n, bshapes[s].k);
+                    fails += run_batch_case(vk_sgemm_batch, vk_create, vk_destroy, nm,
+                                            ops2[ta], ops2[tb],
+                                            bshapes[s].m, bshapes[s].n, bshapes[s].k,
+                                            bshapes[s].lda, bshapes[s].ldb, bshapes[s].ldc,
+                                            bshapes[s].sa, bshapes[s].sb, bshapes[s].sc,
+                                            bshapes[s].batch, 1.0f, 0.0f, 100 + s * 10 + ta * 2 + tb);
+                }
+            }
+        }
+        // alpha/beta 非平凡 + 广播 stride=0 (A/B 共享, C 独立)
+        fails += run_batch_case(vk_sgemm_batch, vk_create, vk_destroy, "alpha=0.5 beta=0.7 b=4",
+                                HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 64, 64, 64,
+                                4096, 4096, 4096, 4, 0.5f, 0.7f, 7);
+        fails += run_batch_case(vk_sgemm_batch, vk_create, vk_destroy, "broadcast strideA=0",
+                                HIPBLAS_OP_N, HIPBLAS_OP_N, 96, 48, 32, 96, 32, 96,
+                                0, 1536, 4608, 6, 1.0f, 0.0f, 8);
+        fails += run_batch_case(vk_sgemm_batch, vk_create, vk_destroy, "broadcast strideB=0",
+                                HIPBLAS_OP_T, HIPBLAS_OP_T, 48, 96, 32, 32, 96, 48,
+                                1536, 0, 4608, 6, 1.0f, 1.0f, 9);
         printf("\n%s (%d failures)\n", fails == 0 ? "ALL PASS" : "FAILURES", fails);
         return fails == 0 ? 0 : 1;
     }
