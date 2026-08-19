@@ -13,6 +13,10 @@ typedef enum {
 
 typedef enum { VKBLAS_OP_N = 0, VKBLAS_OP_T = 1 } vkblas_op_t;
 
+// dma-buf import 缓存失效: 底层 HIP 块基址 == base 的条目全部释放移除。
+// vkblas_hipblas.c 的 hipFree/hipHostFree/hipFreeManaged hook 调用; base==NULL 全清。
+void vkblas_cache_invalidate_base(const void* base);
+
 // 核心 GEMM, row-major 语义(host 侧已完成 hipBLAS 参数翻译):
 //   C[M,N] = alpha * A_eff[M,K] @ B_eff[K,N] + beta * C_old
 //   A_eff: op_a==T 时读 A[k*lda+m], 否则 A[m*lda+k]; B_eff 同理

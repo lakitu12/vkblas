@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <vulkan/vulkan.h>
+#include <hip/hip_runtime_api.h>
 
 #ifndef VKBLAS_SHADER_DIR
 #define VKBLAS_SHADER_DIR "/home/lakitu/code/vkblas/src/shaders"
@@ -21,8 +22,7 @@ typedef hsa_status_t (*hsa_export_dmabuf_fn)(const void* ptr, size_t size,
                                              int* dmabuf, uint64_t* offset);
 
 // ---- 引擎状态 ----
-// 注意: 不做 dma-buf 导入缓存 — hipFree 后地址会被 HIP 复用, 缓存会读到陈旧的
-// dma-buf 引用; 每次调用重新 export/import, 用完即释放 (正确性优先)
+// dma-buf 导入缓存见 import_ptr/ic_*: 条目按 HIP 块基址失效 (hipFree hook), 见下
 static struct {
     int ready;
     VkInstance inst;
@@ -487,9 +487,94 @@ static void ensure_init(void) {
 }
 
 // 导出 HIP 指针为 dma-buf 并导入 Vulkan; 用完即释放 (不缓存)
+// vkblas 导出 (供 hipblas 层 hipFree/hipHostFree/hipFreeManaged hook 调用): 失效并释放
+// 所有底层 HIP 块基址 == base 的缓存条目 (含 base==NULL → 全清, 测试用)
+void vkblas_cache_invalidate_base(const void* base);
+// hipblas 层 free hook 的自证实门控: ==1 表示本进程 free 都经过我们 (可安全缓存)
+extern int vkblas_hook_active;
+
+// ===== dma-buf import 缓存 (小矩阵热路径: 免去每次 GEMM 的 export/create/alloc/bind) =====
+// 正确性模型 (上一版注释的"不能缓存"顾虑已解决):
+//   hipFree 后虚拟地址可能被复用给新分配 — 单凭指针无法区分"同一 VA 不同代"。
+//   因此缓存条目记录底层 HIP 块基址 (hipPointerGetAttributes().devicePointer),
+//   hipblas 层 hook hipFree(ptr) 时按块基址失效全部条目: 块被 free → 其所有 dma-buf
+//   引用立即释放, 复用后的新块必然重新 import。hook 漏网的 (HIP 内部 free) 由
+//   [守卫] base=NULL 的指针不缓存 兜底。
+//   命中成本 = 一次线性查表 (<1μs); miss 成本 = hipPointerGetAttributes (≈1μs) + 原导入。
+#define IC_CAP 256
+struct ic_entry {
+    void* ptr;              // 缓存 key (GEMM 传入的用户指针)
+    const void* base;       // 底层 HIP 块基址 (free hook 的失效键; 无法取得 → 不缓存)
+    size_t size;            // 创建时的 buffer 字节数
+    VkBuffer b;
+    VkDeviceMemory m;
+    VkDeviceSize off;       // dma-buf 内偏移
+};
+static struct ic_entry ic_tab[IC_CAP];
+static uint32_t ic_cnt = 0;
+static uint64_t ic_hits = 0, ic_misses = 0;
+
+// 返回非 NULL 且可用于失效匹配的 HIP 块基址; 无法 vouch 时返回 NULL
+static const void* ic_block_base(const void* ptr) {
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, (hipDeviceptr_t)ptr) != hipSuccess) return NULL;
+    const void* base = attr.type == hipMemoryTypeHost ? attr.hostPointer : attr.devicePointer;
+    return base;
+}
+
+// swap-remove 第 i 条并释放其 Vulkan 对象 (调用方须持锁)
+static void ic_drop(size_t i) {
+    vkDestroyBuffer(g.dev, ic_tab[i].b, NULL);
+    vkFreeMemory(g.dev, ic_tab[i].m, NULL);
+    ic_tab[i] = ic_tab[--ic_cnt];
+}
+
+// 释放所有底层块 == base 的条目 (base==NULL → 全清)
+void vkblas_cache_invalidate_base(const void* base) {
+    if (!g.ready) return;
+    pthread_mutex_lock(&g.lock);
+    for (size_t i = 0; i < ic_cnt; ) {
+        if (base == NULL || ic_tab[i].base == base) ic_drop(i);
+        else i++;
+    }
+    pthread_mutex_unlock(&g.lock);
+}
+
+// 注册新条目 (满则 FIFO 逐出最旧的)
+static void ic_add(const void* ptr, const void* base, size_t size,
+                   VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
+    if (ic_cnt >= IC_CAP) ic_drop(0);   // 简单 FIFO
+    struct ic_entry* e = &ic_tab[ic_cnt++];
+    e->ptr = (void*)ptr; e->base = base; e->size = size;
+    e->b = b; e->m = m; e->off = off;
+}
+
 static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
                       VkDeviceMemory* mem, VkDeviceSize* offset) {
     if (!g.ready) return -1;
+
+    if (ptr != NULL && vkblas_hook_active) {
+        // ---- 缓存快路径: 同一 ptr 且 size 满足 → 直接复用 ----
+        // 双保险: 命中前校验底层 HIP 块基址仍一致 (hook 漏网场景兜底)
+        for (uint32_t i = 0; i < ic_cnt; i++) {
+            if (ic_tab[i].ptr == ptr) {
+                if (size <= ic_tab[i].size && ic_block_base(ptr) == ic_tab[i].base) {
+                    *buf = ic_tab[i].b; *mem = ic_tab[i].m; *offset = ic_tab[i].off;
+                    ic_hits++;
+                    if (getenv("VKBLAS_TRACE"))
+                        fprintf(stderr, "[vkblas] import cache HIT  ptr=%p size=%zu (cached=%zu, n=%u)\n",
+                                ptr, size, ic_tab[i].size, ic_cnt);
+                    return 0;
+                }
+                ic_drop(i);   // size 不够或块已变 → 作废重导
+                break;
+            }
+        }
+    }
+
+    // 可缓存的先取块基址 (hook 未证实或无法 vouch → 不缓存, 每次全量导出)
+    const void* cbase = (ptr != NULL && vkblas_hook_active) ? ic_block_base(ptr) : NULL;
+    int cacheable = cbase != NULL;
 
     int fd = -1;
     uint64_t off = 0;
@@ -559,13 +644,37 @@ static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
             }
         }
     }
+    if (cacheable) {
+        ic_add(ptr, cbase, size, b, m, off);
+        ic_misses++;
+        if (getenv("VKBLAS_TRACE"))
+            fprintf(stderr, "[vkblas] import cache MISS ptr=%p size=%zu (n=%u)\n", ptr, size, ic_cnt);
+    }
     *buf = b; *mem = m; *offset = off;
     return 0;
 }
 
 static void release_ptr(VkDeviceMemory mem, VkBuffer buf) {
+    // 缓存条目由缓存持有生命周期 (hipFree hook / 容量逐出时统一释放), 这里只在
+    // 非缓存对象 (临时 buffer 等) 上真释放
+    for (uint32_t i = 0; i < ic_cnt; i++) {
+        if (ic_tab[i].b == buf && ic_tab[i].m == mem) return;
+    }
     vkDestroyBuffer(g.dev, buf, NULL);
     vkFreeMemory(g.dev, mem, NULL);
+}
+
+// v7-128 tile 适用性 (VKBLAS_TILE128=1, 所有 GEMM 路径统一入口):
+//   128×128 tile 在 M,N≥256 时快 5-36%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度;
+//   本机实测 (gfx803, TT 布局, vk row-major 视角) v7 在 "M≫N 且 tiles>24 (无 split-k)"
+//   的长条大形状反输 v6: (8192,512) v7 14.5ms vs v6 12.6ms; (4096,1024) 14.5 vs 13.3
+//   → 回落 v6; 反之 M≪N 时 v7 大胜 ((512,8192) 10.9 vs 14.5) 保持 v7
+static int pick_tile128(uint32_t M, uint32_t N) {
+    if (getenv("VKBLAS_TILE128") == NULL) return 0;
+    if (M < 256 || N < 256) return 0;
+    uint32_t Mt = (M + 127) / 128, Nt = (N + 127) / 128;
+    if (Mt * Nt > 24 && M > N) return 0;
+    return 1;
 }
 
 // Record helpers used when several compute passes share one submission.
@@ -951,12 +1060,12 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_
     }
     int rc = 0;
     if (op_b == VKBLAS_OP_N) {
-        int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+        int use128 = pick_tile128(M, N);
         rc = run_fused_half_transpose_gemm(dtype, use128, variant,
                                            bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
                                            M, N, K, lda, ldb, ldc, batch,
                                            stride_a, stride_b, stride_c, alpha, beta);
-    } else if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256) {
+    } else if (pick_tile128(M, N)) {
         rc = run_gemm_h128(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
                            M, N, K, lda, ldb, ldc,
                            batch, stride_a, stride_b, stride_c, alpha, beta, 1);
@@ -1034,12 +1143,12 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
 
         int rc = 0;
         if (op_b == VKBLAS_OP_N) {
-            int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+            int use128 = pick_tile128(M, N);
             rc = run_fused_half_transpose_gemm(dtype, use128, variant,
                                                bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
                                                M, N, K, lda, ldb, ldc, 1,
                                                0, 0, 0, alpha, beta);
-        } else if (getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256) {
+        } else if (pick_tile128(M, N)) {
             rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
                                M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
         } else {
@@ -1270,7 +1379,7 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
 
     // VKBLAS_TILE128=1: fp32 GEMM 走 v7-128 tile (llama l_warptile 移植, 实验对比)
     // 128×128 tile 在 M,N≥256 时快 5-36%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度
-    int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+    int use128 = pick_tile128(M, N);
 
     // split-k (llama.cpp 借鉴): K>=2048 时补足 wave 占用; gfx803=36 CU:
     // tiles<=18: split_count=min(36/tiles,8); tiles 19..24: split_count=3;
@@ -1450,7 +1559,7 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
         } else {
             size_t bb_t = (size_t)batch * N * ldb_t * 4;
             cmd_barrier(bBt, bb_t);
-            int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+            int use128 = pick_tile128(M, N);
             if (use128)
                 rc = run_gemm_vk128(variant ^ 1, bA, ba_all, bBt, bb_t, bC, bc_all,
                                     M, N, K, lda, ldb_t, ldc, batch, stride_a,
@@ -1530,7 +1639,7 @@ vkblas_status_t vkblas_gemm_f32(
     }
 
     for (uint32_t i = 0; i < batch; i++) {
-        int use128 = getenv("VKBLAS_TILE128") != NULL && M >= 256 && N >= 256;
+        int use128 = pick_tile128(M, N);
         uint32_t fMt = use128 ? (M + 127) / 128 : (M + 63) / 64;
         uint32_t fNt = use128 ? (N + 127) / 128 : (N + 63) / 64;
         int split_candidate = batch == 1 && K >= 2048 && fMt * fNt <= 24 &&

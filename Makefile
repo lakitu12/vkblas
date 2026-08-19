@@ -163,8 +163,13 @@ test/test_gemm: test/test_gemm.c src/vkblas.h libvkblas_hipblas.so
 test/test_h: test/test_h.c src/vkblas.h libvkblas_hipblas.so
 	$(CC) $(CFLAGS) -o $@ test/test_h.c -lamdhip64 $(LDFLAGS)
 
+# import 缓存 (hit 路径) 回归 — 必须 LD_PRELOAD 运行 (hook 自证实才启用缓存):
+#   LD_PRELOAD=$PWD/libvkblas_hipblas.so ./test/test_cache
+test/test_cache: test/test_cache.c src/vkblas.h libvkblas_hipblas.so
+	$(CC) $(CFLAGS) -o $@ test/test_cache.c -lhipblas -lamdhip64 $(LDFLAGS)
+
 clean:
-	rm -f libvkblas_hipblas.so test/test_gemm test/test_h $(SHADERS)
+	rm -f libvkblas_hipblas.so test/test_gemm test/test_h test/test_cache $(SHADERS)
 
 # --- 部署到本机 ROCm (/opt/rocm-6.4.3/lib) ---
 # 安装版 .so 用 -DVKBLAS_SHADER_DIR 指向固定 shader 目录 (自包含, 不依赖源码树);

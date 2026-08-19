@@ -2,6 +2,7 @@
 *.spv
 *.so
 test/test_gemm
+test/test_cache
 
 # scratch / backups
 *.bak-*

@@ -100,6 +100,39 @@ static int get_scalar_f32(const void* p, float* out) {
     return 0;
 }
 
+// ---------- HIP 内存生命周期 hook (dma-buf import 缓存失效) ----------
+// 导出 hipFree/hipHostFree/hipFreeManaged 并转发真 libamdhip64: 进程内所有对应 free
+// 调用 (LD_PRELOAD 或符号优先场景) 先到我们 → 按块基址失效 import 缓存条目, 杜绝
+// "hipFree 后地址复用 → 缓存读到陈旧 dma-buf"。hipMalloc 不 hook — 缓存 miss 自然注册。
+// vkblas_hook_active 自证实门控: free hook 一旦被调用过, 即证明本进程的 free 都经过
+// 我们 (符号绑定是全局性的), vkblas.c 据此启用 import 缓存; 纯 dlopen (不经 hook)
+// 场景下 free 会绕过我们 → 缓存永久禁用, 退回每次全量导入 (正确性优先)。
+int vkblas_hook_active = 0;
+
+static void* real_amdhip(void) {
+    static void* h = NULL;
+    if (!h) {
+        h = dlopen("libamdhip64.so.6", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("/opt/rocm/lib/libamdhip64.so.6", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    return h;
+}
+
+#define HOOK_FREE(fname)                                                     \
+    hipError_t fname(void* ptr) {                                            \
+        static hipError_t (*real)(void*) = NULL;                             \
+        if (!real) real = (hipError_t(*)(void*))dlsym(real_amdhip(), #fname);\
+        vkblas_hook_active = 1;                                              \
+        if (getenv("VKBLAS_TRACE"))                                          \
+            fprintf(stderr, "[vkblas] %s hook: %p (cache active)\n", #fname, ptr); \
+        vkblas_cache_invalidate_base(ptr);                                   \
+        return real ? real(ptr) : hipErrorRuntimeMemory;                     \
+    }
+
+HOOK_FREE(hipFree)
+HOOK_FREE(hipHostFree)
+HOOK_FREE(hipFreeManaged)
+
 // ---------- 核心: fp32 GEMM (Vulkan) ----------
 // hipBLAS column-major 语义 → Vulkan row-major:
 //   C_rm[n,m] = op(B)^T @ op(A)^T → A_eff=B参数, B_eff=A参数, M'=n, N'=m, K'=k

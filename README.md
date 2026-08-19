@@ -79,8 +79,12 @@ env -u PYTHONPATH -u PYTHONHOME \
    the real hipblas via `dlsym`.
 3. HIP device pointers are exported as dma-buf fds
    (`hsa_amd_portable_export_dmabuf`) and imported into Vulkan as external
-   memory — zero copy. Export/import happens per call (no caching; freed HIP
-   memory reuses addresses).
+   memory — zero copy. Exports are cached per pointer (imports stay alive until
+   the HIP block is freed): the shim hooks `hipFree`/`hipHostFree`/`hipFreeManaged`
+   and invalidates cache entries by HIP block base, so a freed address that is
+   re-malloc'd always gets a fresh export. The cache self-enables only once a
+   free hook call proves all frees in the process route through us (LD_PRELOAD);
+   plain-`dlopen` processes keep the old per-call export/import behaviour.
 4. Row-major B (op_b=N) is transposed host-side by a dedicated transpose shader
    into column-major before the GEMM — a row-major direct read is ~9× slower on
    gfx803/RADV.
