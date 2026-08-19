@@ -328,7 +328,8 @@ hipblasStatus_t hipblasGemmEx_v2(hipblasHandle_t handle, hipblasOperation_t tran
                                  const void* B, hipDataType bType, int ldb, const void* beta, void* C,
                                  hipDataType cType, int ldc, hipblasComputeType_t computeType, hipblasGemmAlgo_t algo) {
     if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
-    fprintf(stderr, "[dbg] hipblasGemmEx_v2 aType=%d\n", (int)aType);
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[dbg] hipblasGemmEx_v2 aType=%d\n", (int)aType);
     if (is_fp32_ex(aType, computeType) && is_fp32_ex(bType, computeType) && cType == HIP_R_32F)
         return vk_gemm_f32(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
