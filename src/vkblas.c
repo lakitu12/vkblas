@@ -54,7 +54,9 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     size_t sk_buf_size;
     // B 转置缓存 (VKBLAS_CACHE_TRANSPOSE=1, 推理场景权重不变): key=(ptr,N,K,ldb)
     // 供 op_b==T && M==1 的 matvec 复用 (PyTorch decode: TB=1 256 路行流 6.4ms → TB=0 0.55ms)
-    struct tc_entry { const void* ptr; uint32_t N, K, ldb; size_t size; VkBuffer b; VkDeviceMemory m; const void* base; } tc_tab[8];
+    struct tc_entry { const void* ptr; uint32_t N, K, ldb; const void* base;
+                       VkBuffer b_kn; VkDeviceMemory m_kn;  // (K×N) 紧密 (TB=0 matvec 用)
+                       VkBuffer b_nk; VkDeviceMemory m_nk; } tc_tab[4];
     int tc_cnt;
     VkDescriptorSet dset;
     // 转置 (TB=0 快路径支持)
@@ -582,8 +584,10 @@ void vkblas_cache_invalidate_base(const void* base) {
     // 转置缓存同失效 (指针复用 → 陈旧转置危险)
     for (int i = 0; i < g.tc_cnt; ) {
         if (base == NULL || g.tc_tab[i].base == base) {
-            vkDestroyBuffer(g.dev, g.tc_tab[i].b, NULL);
-            vkFreeMemory(g.dev, g.tc_tab[i].m, NULL);
+            if (g.tc_tab[i].b_kn) vkDestroyBuffer(g.dev, g.tc_tab[i].b_kn, NULL);
+            if (g.tc_tab[i].m_kn) vkFreeMemory(g.dev, g.tc_tab[i].m_kn, NULL);
+            if (g.tc_tab[i].b_nk) vkDestroyBuffer(g.dev, g.tc_tab[i].b_nk, NULL);
+            if (g.tc_tab[i].m_nk) vkFreeMemory(g.dev, g.tc_tab[i].m_nk, NULL);
             g.tc_tab[i] = g.tc_tab[--g.tc_cnt];
         } else i++;
     }
@@ -1601,68 +1605,93 @@ static int run_matvec_sk_vk(int variant, const void* A, size_t ba,
     return 0;
 }
 
-// B 转置缓存构建/查找 (op_b==T && M==1): (N×K, ldb) → (K×N 紧密) 
-// 返回 0 且 *out 有效; -1 失败 (不影响调用方走原 TB=1 路径)
-static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb,
+// B 转置缓存构建/查找: dir=0 → (K×N) 紧密 (TB=0 matvec 用, 输入 (N×K,ldb));
+// dir=1 → (N×K) 紧密 (TB=1 GEMM 用, 输入 (K×N,ldb))
+// VKBLAS_CACHE_TRANSPOSE=1 启用; 推理场景权重不变才安全
+// 返回 0 且 *out 有效; -1 失败 (调用方走原路径)
+static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir,
                   VkBuffer* out, size_t* out_size, int* built) {
     *built = 0;
     for (int i = 0; i < g.tc_cnt; i++) {
         if (g.tc_tab[i].ptr == ptr && g.tc_tab[i].N == N &&
             g.tc_tab[i].K == K && g.tc_tab[i].ldb == ldb) {
-            *out = g.tc_tab[i].b;
-            *out_size = g.tc_tab[i].size;
-            return 0;
+            VkBuffer b = dir == 0 ? g.tc_tab[i].b_kn : g.tc_tab[i].b_nk;
+            if (b != VK_NULL_HANDLE) { *out = b; *out_size = (size_t)N * K * 4; return 0; }
+            break;  // 条目存在但该方向未构建 → 构建
         }
     }
-    if (g.tc_cnt >= 8) {
-        // 满 → 清最旧
-        vkDestroyBuffer(g.dev, g.tc_tab[0].b, NULL);
-        vkFreeMemory(g.dev, g.tc_tab[0].m, NULL);
+    if (g.tc_cnt >= 4) {
+        VkBuffer b0 = g.tc_tab[0].b_kn, b1 = g.tc_tab[0].b_nk;
+        if (b0) vkDestroyBuffer(g.dev, b0, NULL);
+        if (g.tc_tab[0].m_kn) vkFreeMemory(g.dev, g.tc_tab[0].m_kn, NULL);
+        if (b1) vkDestroyBuffer(g.dev, b1, NULL);
+        if (g.tc_tab[0].m_nk) vkFreeMemory(g.dev, g.tc_tab[0].m_nk, NULL);
         g.tc_tab[0] = g.tc_tab[--g.tc_cnt];
     }
-    // import B 并转置
-    size_t bb = (size_t)(N - 1) * ldb + K;
-    VkBuffer bB; VkDeviceMemory mB; VkDeviceSize oB;
-    if (import_ptr(ptr, bb * 4, &bB, &mB, &oB) != 0) return -1;
+    // 输入布局: dir=0 → In (N×K, ldb); dir=1 → In (K×N, ldb)
+    size_t bb = dir == 0 ? (size_t)(N - 1) * ldb + K : (size_t)(K - 1) * ldb + N;
+    VkBuffer bIn; VkDeviceMemory mIn; VkDeviceSize oIn;
+    if (import_ptr(ptr, bb * 4, &bIn, &mIn, &oIn) != 0) return -1;
     const void* cbase = ic_block_base(ptr);
-    size_t need = (size_t)N * K * 4;
+    const size_t need = (size_t)N * K * 4;
+    // 分配输出 (两方向都要: 转一个, 另一个从它再转)
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = need, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-    VkBuffer bTt; VkDeviceMemory mTt;
-    if (vkCreateBuffer(g.dev, &bci, NULL, &bTt) != VK_SUCCESS) { release_ptr(mB, bB); return -1; }
+    VkBuffer bT0 = VK_NULL_HANDLE, bT1 = VK_NULL_HANDLE;
+    VkDeviceMemory mT0 = VK_NULL_HANDLE, mT1 = VK_NULL_HANDLE;
     VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(g.dev, bTt, &mr);
-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size };
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = 0 };
     VkPhysicalDeviceMemoryProperties mprops;
     vkGetPhysicalDeviceMemoryProperties(g.phys, &mprops);
+    int mtype = -1;
     for (uint32_t t = 0; t < mprops.memoryTypeCount; t++) {
-        if (mr.memoryTypeBits & (1u << t) &&
-            (mprops.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            mai.memoryTypeIndex = t; break;
+        if ((mprops.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { mtype = t; break; }
+    }
+    if (mtype < 0) { release_ptr(mIn, bIn); return -1; }
+    for (int which = 0; which < 2; which++) {
+        if (vkCreateBuffer(g.dev, &bci, NULL, which ? &bT1 : &bT0) != VK_SUCCESS) { goto tc_fail; }
+        vkGetBufferMemoryRequirements(g.dev, which ? bT1 : bT0, &mr);
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mtype;
+        if (vkAllocateMemory(g.dev, &mai, NULL, which ? &mT1 : &mT0) != VK_SUCCESS ||
+            vkBindBufferMemory(g.dev, which ? bT1 : bT0, which ? mT1 : mT0, 0) != VK_SUCCESS) {
+            goto tc_fail;
         }
     }
-    if (vkAllocateMemory(g.dev, &mai, NULL, &mTt) != VK_SUCCESS ||
-        vkBindBufferMemory(g.dev, bTt, mTt, 0) != VK_SUCCESS) {
-        vkDestroyBuffer(g.dev, bTt, NULL);
-        release_ptr(mB, bB);
-        return -1;
+    {
+        // 两次转置必须独立 submit: transpose_into 共用 g.tdset, 连续录制会让
+        // 前一个 dispatch 读到后一个的绑定 (descriptor 立即生效)
+        uint32_t ldout0 = 0;
+        cmd_begin();
+        if (dir == 0)
+            transpose_into(bIn, bb * 4, bT0, need, N, K, ldb, &ldout0, 1, 0, 0, 0);
+        else
+            transpose_into(bIn, bb * 4, bT0, need, K, N, ldb, &ldout0, 1, 0, 0, 0);
+        cmd_end_submit("tc build t0 submit");
+        ldout0 = 0;
+        cmd_begin();
+        transpose_into(bT0, need, bT1, need, dir == 0 ? K : N, dir == 0 ? N : K,
+                       dir == 0 ? N : K, &ldout0, 1, 0, 0, 0);
+        cmd_end_submit("tc build t1 submit");
     }
-    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
-    cmd_begin();
-    uint32_t ldout = 0;
-    // In (N×K, ldb) → Out (K×N 紧密): transpose_into 的 R/C 是 In 的行列
-    transpose_into(bB, bb * 4, bTt, need, N, K, ldb, &ldout, 1, 0, 0, 0);
-    cmd_end_submit("cached transpose submit");
-    release_ptr(mB, bB);
-    // 存缓存 (base 用于失效)
-    struct tc_entry* e = &g.tc_tab[g.tc_cnt++];
-    e->ptr = ptr; e->N = N; e->K = K; e->ldb = ldb; e->size = need;
-    e->b = bTt; e->m = mTt; e->base = cbase;
-    *out = bTt; *out_size = need;
+    release_ptr(mIn, bIn);
+    {
+        struct tc_entry* e = &g.tc_tab[g.tc_cnt++];
+        e->ptr = ptr; e->N = N; e->K = K; e->ldb = ldb; e->base = cbase;
+        if (dir == 0) { e->b_kn = bT0; e->m_kn = mT0; e->b_nk = bT1; e->m_nk = mT1; }
+        else          { e->b_nk = bT0; e->m_nk = mT0; e->b_kn = bT1; e->m_kn = mT1; }
+        *out = dir == 0 ? e->b_kn : e->b_nk;
+    }
+    *out_size = need;
     *built = 1;
     return 0;
+tc_fail:
+    if (bT0) vkDestroyBuffer(g.dev, bT0, NULL);
+    if (bT1) vkDestroyBuffer(g.dev, bT1, NULL);
+    if (mT0) vkFreeMemory(g.dev, mT0, NULL);
+    if (mT1) vkFreeMemory(g.dev, mT1, NULL);
+    release_ptr(mIn, bIn);
+    return -1;
 }
 
 // matvec split-k (M==1 decode, wg 不足时): pass1 各 K 段写 Sk[seg][N], pass2 reduce→C
@@ -2164,7 +2193,7 @@ vkblas_status_t vkblas_gemm_f32(
         if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL &&
             g.mpipe[0] != VK_NULL_HANDLE) {
             VkBuffer bBt; size_t bt_sz; int built;
-            if (tc_get(B, N, K, ldb, &bBt, &bt_sz, &built) == 0)
+            if (tc_get(B, N, K, ldb, 0, &bBt, &bt_sz, &built) == 0)
                 mrc = run_matvec_sk_vk(0, A, ba_mv, bBt, bt_sz, C, bc_mv,
                                        K, N, N, ldc, alpha, beta);
             else
@@ -2259,9 +2288,28 @@ vkblas_status_t vkblas_gemm_f32(
                 pthread_mutex_unlock(&g.lock);
                 return VKBLAS_ERR_IMPORT;
             }
-            int frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
+            int frc;
+            // VKBLAS_CACHE_TRANSPOSE: B (K×N,ldb) → (N×K) 紧密缓存 (推理权重不变)
+            if (batch == 1 && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+                VkBuffer bBt; size_t bt_sz; int tbuilt;
+                if (tc_get((const void*)pb, N, K, ldb, 1, &bBt, &bt_sz, &tbuilt) == 0) {
+                    // 用缓存转置直接跑 GEMM (TB=1, ldb_t=N 紧密)
+                    if (use128)
+                        frc = run_gemm_vk128(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
+                                             M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
+                    else
+                        frc = run_gemm_vk(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
+                                          M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
+                } else {
+                    frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
+                                                       bC2, bc, M, N, K, lda, ldb, ldc,
+                                                       1, 0, 0, 0, alpha, beta);
+                }
+            } else {
+                frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
                                                    bC2, bc, M, N, K, lda, ldb, ldc,
                                                    1, 0, 0, 0, alpha, beta);
+            }
             release_ptr(mA2, bA2); release_ptr(mB2, bB2); release_ptr(mC2, bC2);
             if (frc != 0) {
                 pthread_mutex_unlock(&g.lock);
@@ -2283,10 +2331,32 @@ vkblas_status_t vkblas_gemm_f32(
                 return VKBLAS_ERR_IMPORT;
             }
         } else {
-            if (run_gemm(variant, pa, VK_NULL_HANDLE, pb, pc, ba, bb, bc,
-                         M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta) != 0) {
-                pthread_mutex_unlock(&g.lock);
-                return VKBLAS_ERR_IMPORT;
+            // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 紧密 → TB=0 GEMM
+            // (TB=1 的 B 布局直读是 256 路行流, 慢 10x)
+            int okt = 0;
+            if (batch == 1 && op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+                VkBuffer bBt; size_t bt_sz; int tbuilt;
+                if (tc_get((const void*)pb, N, K, ldb, 0, &bBt, &bt_sz, &tbuilt) == 0) {
+                    VkBuffer bA3, bC3; VkDeviceMemory mA3, mC3; VkDeviceSize oA3, oC3;
+                    if (import_ptr(pa, ba, &bA3, &mA3, &oA3) == 0 &&
+                        import_ptr(pc, bc, &bC3, &mC3, &oC3) == 0) {
+                        (void)oA3; (void)oC3;
+                        if (use128)
+                            okt = run_gemm_vk128(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
+                                                 M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                        else
+                            okt = run_gemm_vk(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
+                                              M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                        release_ptr(mA3, bA3); release_ptr(mC3, bC3);
+                    }
+                }
+            }
+            if (!okt) {
+                if (run_gemm(variant, pa, VK_NULL_HANDLE, pb, pc, ba, bb, bc,
+                             M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta) != 0) {
+                    pthread_mutex_unlock(&g.lock);
+                    return VKBLAS_ERR_IMPORT;
+                }
             }
         }
         pa += stride_a * 4; pb += stride_b * 4; pc += stride_c * 4;
