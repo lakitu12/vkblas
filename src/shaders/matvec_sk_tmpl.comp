@@ -1,12 +1,22 @@
 #version 450
 // matvec_sk: M=1 decode split-k pass1 — C_partial[seg][N] = Σ_{k∈seg} A[k]·B[k*ldb+n]
-// pass2 用现有 split_k_reduce: Sk[seg*N+n] 归约到 C (alpha/beta 在 reduce)
+// pass2 用 split_k_reduce[_h]: Sk[seg*N+n] 归约到 C (alpha/beta 在 reduce)
 // 变体宏 TB: 0=B(K×N) 直读, 1=B(N×K) 列读
-// 并行度: wg = ceil(N/256) × k_split, 补足 36 CU 占用 (N=4096 时 16×9=144 wg)
+// HALF: 1=fp16 2=bf16 (A/B 2B 位模式 uint 数组, Sk 仍 fp32 中间精度;
+//       TB=0 下每线程 2 列 (1 uint 对齐, 要求 ldb 偶 && N 偶)
+// 并行度: wg = ceil(N/256) × k_split (HALF 时 N/512), 补足 36 CU 占用
+#if HALF == 1
+float h2f(uint u, uint hb) {
+    vec2 v = unpackHalf2x16(u);
+    return hb == 0u ? v.x : v.y;
+}
+#elif HALF == 2
+float h2f(uint u, uint hb) { return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u); }
+#endif
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) buffer A_buf { float A[]; };
-layout(set = 0, binding = 1) buffer B_buf { float B[]; };
+layout(set = 0, binding = 0) buffer A_buf { uint A[]; };
+layout(set = 0, binding = 1) buffer B_buf { uint B[]; };
 layout(set = 0, binding = 2) buffer Sk_buf { float Sk[]; };
 
 layout(push_constant) uniform Params {
@@ -18,17 +28,18 @@ layout(push_constant) uniform Params {
 
 void main() {
     uint tid = gl_LocalInvocationIndex;
-    uint n = gl_WorkGroupID.x * 256 + tid;
     uint seg = gl_WorkGroupID.z;              // K 段 (z 轴 dispatch)
     uint k_begin = seg * p.k_split;
     uint k_end = min(p.K, k_begin + p.k_split);
 
+#if HALF == 0
+    uint n = gl_WorkGroupID.x * 256 + tid;
     float acc = 0.0;
 #if TB == 0
     // B 是 (K×N): B[k*ldb + n], n 每线程 1 列 (wave 内 256 连续 n)
     if (n < p.N) {
         for (uint k = k_begin; k < k_end; k++) {
-            acc += A[k] * B[k * p.ldb + n];
+            acc += uintBitsToFloat(A[k]) * uintBitsToFloat(B[k * p.ldb + n]);
         }
         Sk[seg * p.N + n] = acc;
     }
@@ -37,9 +48,25 @@ void main() {
     if (n < p.N) {
         uint base = n * p.ldb;
         for (uint k = k_begin; k < k_end; k++) {
-            acc += A[k] * B[base + k];
+            acc += uintBitsToFloat(A[k]) * uintBitsToFloat(B[base + k]);
         }
         Sk[seg * p.N + n] = acc;
+    }
+#endif
+#else
+    // 2B 变体 (TB==0): 每线程 2 列, B[k*ldb+2t] 连续 2 half = 1 uint (ldb 偶保证对齐)
+    uint n0 = gl_WorkGroupID.x * 512 + tid * 2;
+    float acc0 = 0.0, acc1 = 0.0;
+    if (n0 + 1 < p.N) {
+        for (uint k = k_begin; k < k_end; k++) {
+            uint ua = A[k >> 1];
+            float a = h2f(ua, k & 1u);
+            uint ub = B[(k * p.ldb + n0) >> 1];
+            acc0 += a * h2f(ub, 0u);
+            acc1 += a * h2f(ub, 1u);
+        }
+        Sk[seg * p.N + n0] = acc0;
+        Sk[seg * p.N + n0 + 1] = acc1;
     }
 #endif
 }

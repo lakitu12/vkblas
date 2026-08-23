@@ -1,0 +1,37 @@
+#version 450
+// split_k_reduce_h: Sk[split_k][N] fp32 → C[N] 2B 半精度 (M==1 matvec 用)
+// 每线程 2 列 (j0 偶) → 1 uint 对齐写; HALF: 1=fp16 2=bf16
+#if HALF == 1
+uint f2h(float v) { return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu; }
+float h2f(uint u, uint hb) { return unpackHalf2x16(u)[hb]; }
+#else
+uint f2h(float v) { return floatBitsToUint(v) >> 16u; }
+float h2f(uint u, uint hb) { return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u); }
+#endif
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Sk_buf { float Sk[]; };
+layout(set = 0, binding = 1) buffer C_buf { uint C[]; };
+layout(push_constant) uniform Params {
+    uint ne;        // N (M==1)
+    uint k_num;     // split_k
+    uint N;
+    uint ldc;       // 2B 元素步长 (偶)
+    float alpha, beta;
+} p;
+
+void main() {
+    uint j0 = gl_GlobalInvocationID.x * 2;
+    if (j0 + 1 >= p.N) return;
+    float s0 = 0.0, s1 = 0.0;
+    for (uint k = 0; k < p.k_num; k++) {
+        s0 += Sk[k * p.ne + j0];
+        s1 += Sk[k * p.ne + j0 + 1];
+    }
+    float c0 = 0.0, c1 = 0.0;
+    if (p.beta != 0.0) {
+        uint u = C[j0 >> 1];  // M==1, ldc 偶: 行 0, j0 偶 → 同 uint
+        c0 = h2f(u, 0u); c1 = h2f(u, 1u);
+    }
+    C[j0 >> 1] = f2h(p.alpha * s0 + p.beta * c0) |
+                 (f2h(p.alpha * s1 + p.beta * c1) << 16u);
+}
