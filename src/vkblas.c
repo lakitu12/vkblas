@@ -65,7 +65,7 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     // bf16 回退: cvt pipeline (复用 tpl 布局: 2 storage buffer + 20B push)
     // 0 = bf16→fp32, 1 = bf16→fp32转置, 2 = fp32→bf16 (ldout 偶, 列对), 3 = fp32→bf16 (原子)
     VkPipeline cpipe[8];
-    VkDescriptorSet cdset[8];
+    VkDescriptorSet cdset[16];  // [0..7]=pipe 默认, [8..15]=融合路径实例槽 (A/B/C 独立)
     // complex64 回退: cvt_cx (3-binding layout) + cx_combine (4-binding layout)
     VkDescriptorSetLayout cxl;      // 3 storage (In, OutR, OutI / InR, InI, Out)
     VkPipelineLayout cxpl;
@@ -266,9 +266,9 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
 
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40 };  // GEMM 3+转置 2+cvt 4×2+fp16 cvt 3×2+cx 2×3+cmb 4+cz 3+cm64 4
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 72 };  // GEMM 3+转置 2+cvt 8×2+实例 8×2+cx 2×3+cmb 4+cz 3+cm64 4
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 15, .poolSizeCount = 1, .pPoolSizes = &ps };
+        .maxSets = 24, .poolSizeCount = 1, .pPoolSizes = &ps };
     vk_check(vkCreateDescriptorPool(g.dev, &dpci, NULL, &g.dpool), "desc pool");
     VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.dsl };
@@ -315,6 +315,12 @@ static void init_vkblas(void) {
         VkDescriptorSetAllocateInfo cdai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.tdsl };
         vk_check(vkAllocateDescriptorSets(g.dev, &cdai, &g.cdset[i]), "c dset");
+    }
+    // 融合路径实例槽 [8..15]: 每 pipe 2 个额外 (A/B 同 pipe 需独立 dset)
+    for (int i = 8; i < 16; i++) {
+        VkDescriptorSetAllocateInfo cdai2 = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = g.dpool, .descriptorSetCount = 1, .pSetLayouts = &g.tdsl };
+        vk_check(vkAllocateDescriptorSets(g.dev, &cdai2, &g.cdset[i]), "c dset2");
     }
 
     // ---- f16/bf16 直通 GEMM pipeline (复用 g.dsl/g.pl: 3 storage + 44B push) ----
@@ -1771,13 +1777,14 @@ static int ensure_ibuf(int i, size_t need) {
 // R×C 有效区域, ldin/ldout 元素步长; 分块: 纯搬运, 大 dispatch 会性能崩溃 → 8MB/块
 // submit==0: 记录到已打开的 command buffer (调用方负责 begin/end/submit)
 static int cvt_run(int pipe, VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t bytes_out,
-                   uint32_t R, uint32_t C, uint32_t ldin, uint32_t ldout, int submit) {
+                   uint32_t R, uint32_t C, uint32_t ldin, uint32_t ldout, int submit,
+                   int dslot) {
     if (g.cpipe[pipe] == VK_NULL_HANDLE) return -1;
     VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, bytes_out} };
     VkWriteDescriptorSet wds[2];
     for (int i = 0; i < 2; i++) {
         wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = g.cdset[pipe], .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .dstSet = g.cdset[dslot], .dstBinding = (uint32_t)i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
     }
     vkUpdateDescriptorSets(g.dev, 2, wds, 0, NULL);
@@ -1789,7 +1796,7 @@ static int cvt_run(int pipe, VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_
         vkBeginCommandBuffer(g.cmd, &cbbi);
     }
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.cpipe[pipe]);
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.cdset[pipe], 0, NULL);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.cdset[dslot], 0, NULL);
     if (pipe == 3 || pipe == 7) {
         // 线性 uint 对模式 (f2b/f2h 奇数 ldout): total = (R-1)*ldout+C 半字,
         // 每线程 2 个连续半字写 1 uint (非原子, 跨行安全, 无需前置清零)
@@ -1816,11 +1823,16 @@ static int cvt_run(int pipe, VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_
     uint32_t rows_per = (8u * 1024 * 1024) / (C * 4u);
     if (rows_per < 32) rows_per = 32;
     if (rows_per > 4096) rows_per = 4096;
+    // 每行线程数 (每线程处理的元素数):
+    //   pipe 0/1 (b2f, b2f_tsp) = 2 元素对 → (C+1)/2
+    //   pipe 2 (f2b 列对)        = 2 列对   → (C+1)/2
+    //   pipe 4/5 (h2f)           = 2 元素对 → (C+1)/2
+    //   pipe 6 (f2h 列对)        = 2 列对   → (C+1)/2
+    //   pipe 3/7 (f2b/f2h 线性 uint 对) 在独立分支处理
+    uint32_t per_row = (C + 1) / 2;
     for (uint32_t ro = 0; ro < R; ro += rows_per) {
         pc.roff = ro;
         uint32_t rows = R - ro < rows_per ? R - ro : rows_per;
-        // 每行线程数: b2f 2元素/线程 → C/2; f2b 列对 → ceil(C/2); f2b 原子 → C
-        uint32_t per_row = (pipe <= 1) ? ((C + 1) / 2) : (pipe == 2 ? (C + 1) / 2 : C);
         uint32_t threads = rows * per_row;
         vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(g.cmd, (threads + 255) / 256, 1, 1);
@@ -2149,9 +2161,9 @@ vkblas_status_t vkblas_gemm_bf16(
         // 内部流水单提交: cvt(bf16→fp32) → transpose(optional) → (optional cvt C) → GEMM → f2b
         int rc = 0;
         cmd_begin();
-        rc |= cvt_run(0, bA, ba_e * 2, g.ibuf[0], ba2, Ra, Ca, lda, lda, 0);
+        rc |= cvt_run(0, bA, ba_e * 2, g.ibuf[0], ba2, Ra, Ca, lda, lda, 0, 0);
         uint64_t t1 = trace ? now_us() : 0;
-        rc |= cvt_run(0, bB, bb_e * 2, g.ibuf[1], bb2, Rb, Cb, ldb, ldb, 0);
+        rc |= cvt_run(0, bB, bb_e * 2, g.ibuf[1], bb2, Rb, Cb, ldb, ldb, 0, 8);
         uint64_t t2 = trace ? now_us() : 0;
         if (rc == 0) cmd_barrier(g.ibuf[0], ba2), cmd_barrier(g.ibuf[1], bb2);
         VkBuffer bBt = VK_NULL_HANDLE;
@@ -2163,7 +2175,7 @@ vkblas_status_t vkblas_gemm_bf16(
         }
         uint64_t t3 = trace ? now_us() : 0;
         if (rc == 0 && beta != 0.0f) {
-            rc |= cvt_run(0, bC, bc_e * 2, g.ibuf[2], bc2, M, N, ldc, ldc, 0);
+            rc |= cvt_run(0, bC, bc_e * 2, g.ibuf[2], bc2, M, N, ldc, ldc, 0, 9);
             if (rc == 0) cmd_barrier(g.ibuf[2], bc2);
         }
         uint64_t t3b = trace ? now_us() : 0;
@@ -2175,7 +2187,7 @@ vkblas_status_t vkblas_gemm_bf16(
         if (rc != 0) { vkEndCommandBuffer(g.cmd); release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
         cmd_barrier(g.ibuf[2], bc2);
         uint64_t t4 = trace ? now_us() : 0;
-        rc = cvt_run((ldc & 1) ? 3 : 2, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc, 0);
+        rc = cvt_run((ldc & 1) ? 3 : 2, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc, 0, (ldc & 1) ? 3 : 2);
         if (rc != 0) { vkEndCommandBuffer(g.cmd); release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
         cmd_end_submit("fused bf16 fallback");
         uint64_t t5 = trace ? now_us() : 0;
@@ -2272,9 +2284,9 @@ vkblas_status_t vkblas_gemm_f16(
 
         int rc = 0;
         cmd_begin();
-        rc |= cvt_run(4, bA, ba_e * 2, g.ibuf[0], ba2, Ra, Ca, lda, lda, 0);
+        rc |= cvt_run(4, bA, ba_e * 2, g.ibuf[0], ba2, Ra, Ca, lda, lda, 0, 4);
         uint64_t t1 = trace ? now_us() : 0;
-        rc |= cvt_run(4, bB, bb_e * 2, g.ibuf[1], bb2, Rb, Cb, ldb, ldb, 0);
+        rc |= cvt_run(4, bB, bb_e * 2, g.ibuf[1], bb2, Rb, Cb, ldb, ldb, 0, 12);
         uint64_t t2 = trace ? now_us() : 0;
         if (rc == 0) cmd_barrier(g.ibuf[0], ba2), cmd_barrier(g.ibuf[1], bb2);
         VkBuffer bBt = VK_NULL_HANDLE;
@@ -2286,7 +2298,7 @@ vkblas_status_t vkblas_gemm_f16(
         }
         uint64_t t3 = trace ? now_us() : 0;
         if (rc == 0 && beta != 0.0f) {
-            rc |= cvt_run(4, bC, bc_e * 2, g.ibuf[2], bc2, M, N, ldc, ldc, 0);
+            rc |= cvt_run(4, bC, bc_e * 2, g.ibuf[2], bc2, M, N, ldc, ldc, 0, 13);
             if (rc == 0) cmd_barrier(g.ibuf[2], bc2);
         }
         uint64_t t3b = trace ? now_us() : 0;
@@ -2298,7 +2310,8 @@ vkblas_status_t vkblas_gemm_f16(
         if (rc != 0) { vkEndCommandBuffer(g.cmd); release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
         cmd_barrier(g.ibuf[2], bc2);
         uint64_t t4 = trace ? now_us() : 0;
-        rc = cvt_run((ldc & 1) ? 7 : 6, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc, 0);
+
+        rc = cvt_run((ldc & 1) ? 7 : 6, g.ibuf[2], bc2, bC, bc_e * 2, M, N, ldc, ldc, 0, (ldc & 1) ? 7 : 6);
         if (rc != 0) { vkEndCommandBuffer(g.cmd); release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC); pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_IMPORT; }
         cmd_end_submit("fused f16 fallback");
         uint64_t t5 = trace ? now_us() : 0;
