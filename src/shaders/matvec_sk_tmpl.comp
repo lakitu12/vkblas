@@ -44,10 +44,18 @@ void main() {
         Sk[seg * p.N + n] = acc;
     }
 #else
-    // B 是 (N×K): B[n*ldb + k], k 连续读
+    // B 是 (N×K): B[n*ldb + k], k 连续读; vec4 步 4 减少行缓冲切换
     if (n < p.N) {
         uint base = n * p.ldb;
-        for (uint k = k_begin; k < k_end; k++) {
+        uint k = k_begin;
+        for (; k + 4 <= k_end; k += 4) {
+            uvec4 u = uvec4(B[base+k], B[base+k+1], B[base+k+2], B[base+k+3]);
+            acc += uintBitsToFloat(u.x) * uintBitsToFloat(A[k])
+                 + uintBitsToFloat(u.y) * uintBitsToFloat(A[k+1])
+                 + uintBitsToFloat(u.z) * uintBitsToFloat(A[k+2])
+                 + uintBitsToFloat(u.w) * uintBitsToFloat(A[k+3]);
+        }
+        for (; k < k_end; k++) {
             acc += uintBitsToFloat(A[k]) * uintBitsToFloat(B[base + k]);
         }
         Sk[seg * p.N + n] = acc;
