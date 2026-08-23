@@ -1,10 +1,13 @@
 #version 450
-// matvec v1: C(M=1, N) = A(1, K) · B, decode 专用
+// matvec v2: C(M=1, N) = A(1, K) · B, decode 专用
 // 消除 M=1 GEMM 的 B 全量转置 (64MB 读写浪费): B 直接合并读
 // 变体宏:
-//   TB=0: B 是 (K×N) row-major, B_eff[k][n] = B[k*ldb+n]: 每线程 4 列, 每 k 连续读 4
+//   TB=0: B 是 (K×N) row-major, B_eff[k][n] = B[k*ldb+n]: 每线程 MV_COLS 列连续读
 //   TB=1: B 是 (N×K) row-major, B_eff[k][n] = B[n*ldb+k]: 每线程 1 列, vec4 读 k
 // A[k] 每线程读 (同 wg 内广播, L2 命中)
+#ifndef MV_COLS
+#define MV_COLS 4
+#endif
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) buffer A_buf { float A[]; };
@@ -19,23 +22,20 @@ layout(push_constant) uniform Params {
 
 void main() {
     uint tid = gl_LocalInvocationIndex;
-    uint n0 = gl_WorkGroupID.x * 1024;
+    uint n0 = gl_WorkGroupID.x * (256u * MV_COLS);
 
 #if TB == 0
-    // B 是 (K×N): 每线程 4 列, 每 k 读 4 个连续 n (合并)
-    uint j0 = n0 + tid * 4;
-    float acc[4];
-    for (int i = 0; i < 4; i++) acc[i] = 0.0;
-    if (j0 + 3 < p.N) {
+    // B 是 (K×N): 每线程 MV_COLS 列, 每 k 读 MV_COLS 个连续 n (合并)
+    uint j0 = n0 + tid * MV_COLS;
+    float acc[MV_COLS];
+    for (int i = 0; i < MV_COLS; i++) acc[i] = 0.0;
+    if (j0 + MV_COLS - 1 < p.N) {
         for (uint k = 0; k < p.K; k++) {
             float a = A[k];
             uint base = k * p.ldb + j0;
-            acc[0] += a * B[base + 0];
-            acc[1] += a * B[base + 1];
-            acc[2] += a * B[base + 2];
-            acc[3] += a * B[base + 3];
+            for (int i = 0; i < MV_COLS; i++) acc[i] += a * B[base + i];
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MV_COLS; i++) {
             uint j = j0 + uint(i);
             float c = (p.beta != 0.0) ? C[j] : 0.0;
             C[j] = p.alpha * acc[i] + p.beta * c;
@@ -43,12 +43,12 @@ void main() {
     } else {
         for (uint k = 0; k < p.K; k++) {
             float a = A[k];
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < MV_COLS; i++) {
                 uint j = j0 + uint(i);
                 if (j < p.N) acc[i] += a * B[k * p.ldb + j];
             }
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MV_COLS; i++) {
             uint j = j0 + uint(i);
             if (j < p.N) {
                 float c = (p.beta != 0.0) ? C[j] : 0.0;

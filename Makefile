@@ -8,6 +8,7 @@ SHADER_DIR = src/shaders
 SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm_nt.spv $(SHADER_DIR)/gemm_tt.spv \
           $(SHADER_DIR)/matvec_n.spv $(SHADER_DIR)/matvec_t.spv \
+          $(SHADER_DIR)/matvec_sk_n.spv $(SHADER_DIR)/matvec_sk_t.spv \
           $(SHADER_DIR)/gemm128_nn.spv $(SHADER_DIR)/gemm128_tn.spv \
           $(SHADER_DIR)/gemm128_nt.spv $(SHADER_DIR)/gemm128_tt.spv \
           $(SHADER_DIR)/gemm_h16_nn.spv $(SHADER_DIR)/gemm_h16_tn.spv \
@@ -51,6 +52,10 @@ $(SHADER_DIR)/gemm_tt.spv: $(SHADER_DIR)/gemm_tmpl.comp
 $(SHADER_DIR)/matvec_n.spv: $(SHADER_DIR)/matvec_tmpl.comp
 	glslangValidator -V -DTB=0 $< -o $@
 $(SHADER_DIR)/matvec_t.spv: $(SHADER_DIR)/matvec_tmpl.comp
+	glslangValidator -V -DTB=1 $< -o $@
+$(SHADER_DIR)/matvec_sk_n.spv: $(SHADER_DIR)/matvec_sk_tmpl.comp
+	glslangValidator -V -DTB=0 $< -o $@
+$(SHADER_DIR)/matvec_sk_t.spv: $(SHADER_DIR)/matvec_sk_tmpl.comp
 	glslangValidator -V -DTB=1 $< -o $@
 $(SHADER_DIR)/transpose.spv: $(SHADER_DIR)/transpose.comp
 	glslangValidator -V $< -o $@

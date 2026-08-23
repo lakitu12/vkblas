@@ -1,0 +1,45 @@
+#version 450
+// matvec_sk: M=1 decode split-k pass1 — C_partial[seg][N] = Σ_{k∈seg} A[k]·B[k*ldb+n]
+// pass2 用现有 split_k_reduce: Sk[seg*N+n] 归约到 C (alpha/beta 在 reduce)
+// 变体宏 TB: 0=B(K×N) 直读, 1=B(N×K) 列读
+// 并行度: wg = ceil(N/256) × k_split, 补足 36 CU 占用 (N=4096 时 16×9=144 wg)
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { float A[]; };
+layout(set = 0, binding = 1) buffer B_buf { float B[]; };
+layout(set = 0, binding = 2) buffer Sk_buf { float Sk[]; };
+
+layout(push_constant) uniform Params {
+    uint K, N;
+    uint ldb;
+    uint k_split;   // 每 seg 的 K 跨度
+    uint pad;
+} p;
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint n = gl_WorkGroupID.x * 256 + tid;
+    uint seg = gl_WorkGroupID.z;              // K 段 (z 轴 dispatch)
+    uint k_begin = seg * p.k_split;
+    uint k_end = min(p.K, k_begin + p.k_split);
+
+    float acc = 0.0;
+#if TB == 0
+    // B 是 (K×N): B[k*ldb + n], n 每线程 1 列 (wave 内 256 连续 n)
+    if (n < p.N) {
+        for (uint k = k_begin; k < k_end; k++) {
+            acc += A[k] * B[k * p.ldb + n];
+        }
+        Sk[seg * p.N + n] = acc;
+    }
+#else
+    // B 是 (N×K): B[n*ldb + k], k 连续读
+    if (n < p.N) {
+        uint base = n * p.ldb;
+        for (uint k = k_begin; k < k_end; k++) {
+            acc += A[k] * B[base + k];
+        }
+        Sk[seg * p.N + n] = acc;
+    }
+#endif
+}
