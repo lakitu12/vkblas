@@ -36,7 +36,8 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkPipeline pipe[4];   // idx = op_a*2 + op_b: nn,tn,nt,tt
-    VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 32 acc/线程
+    VkPipeline mpipe[2];  // matvec (M==1 decode, 免 B 转置): [0]=TB=0 (K×N 直读), [1]=TB=1 (N×K 列读)
+    VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 64 acc/线程
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
     // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
     VkPipeline pipe_h[2][4];
@@ -104,6 +105,8 @@ static void vk_check(VkResult r, const char* what) {
         abort();
     }
 }
+
+static uint64_t now_us(void);  // 定义见 bf16 计时段 (VKBLAS_PROFILE/TRACE 用)
 
 static void* load_hsa(void) {
     void* h = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_GLOBAL);
@@ -230,6 +233,18 @@ static void init_vkblas(void) {
                        VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
             .layout = g.pl };
         vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cpci2, NULL, &g.pipe[i]), "pipeline");
+        vkDestroyShaderModule(g.dev, sm, NULL);
+    }
+    // matvec (M==1 decode): 免 B 转置; [0]=B(K×N) 直读, [1]=B(N×K) 列读
+    static const char* mnames[2] = { "matvec_n.spv", "matvec_t.spv" };
+    for (int i = 0; i < 2; i++) {
+        g.mpipe[i] = VK_NULL_HANDLE;
+        if (load_spv(mnames[i], &sm) != 0) continue;
+        VkComputePipelineCreateInfo mcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+            .layout = g.pl };
+        vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &mcp, NULL, &g.mpipe[i]), "matvec pipe");
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // v7-128 tile (实验性, 缺 shader 则不可用; VKBLAS_TILE128=1 时 fp32 GEMM 走此路径)
@@ -552,6 +567,8 @@ static void ic_add(const void* ptr, const void* base, size_t size,
 static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
                       VkDeviceMemory* mem, VkDeviceSize* offset) {
     if (!g.ready) return -1;
+    int profile = getenv("VKBLAS_PROFILE") != NULL;
+    double t0 = profile ? now_us() : 0;
 
     if (ptr != NULL && vkblas_hook_active) {
         // ---- 缓存快路径: 同一 ptr 且 size 满足 → 直接复用 ----
@@ -651,6 +668,9 @@ static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
         if (getenv("VKBLAS_TRACE"))
             fprintf(stderr, "[vkblas] import cache MISS ptr=%p size=%zu (n=%u)\n", ptr, size, ic_cnt);
     }
+    if (profile)
+        fprintf(stderr, "[vkblas] prof: import ptr=%p size=%zu took %.2fms%s\n",
+                ptr, size, (now_us() - t0) / 1e3, cacheable ? " (cached)" : " (uncacheable)");
     *buf = b; *mem = m; *offset = off;
     return 0;
 }
@@ -711,11 +731,19 @@ static void cmd_barrier(VkBuffer buffer, VkDeviceSize size) {
 }
 
 static void cmd_end_submit(const char* what) {
+    int profile = getenv("VKBLAS_PROFILE") != NULL;
+    uint64_t t0 = profile ? now_us() : 0;
     vk_check(vkEndCommandBuffer(g.cmd), what);
+    uint64_t t1 = profile ? now_us() : 0;
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &g.cmd };
     vk_check(vkQueueSubmit(g.queue, 1, &si, VK_NULL_HANDLE), what);
+    uint64_t t2 = profile ? now_us() : 0;
     vk_check(vkQueueWaitIdle(g.queue), what);
+    uint64_t t3 = profile ? now_us() : 0;
+    if (profile)
+        fprintf(stderr, "[vkblas] prof: %s end=%.2fus submit=%.2fus wait=%.2fms\n",
+                what, (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3);
 }
 
 // 转置核心: out[N][K] = in[K][N]^T (row-major), in 行步长 ldin, out 紧密 (行步长 N)
@@ -741,8 +769,15 @@ static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t n
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpipe);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.tdset, 0, NULL);
     // 按 8MB/块动态分块 (实测最优 ~2048 wg/8MB; 固定 512 行对小 N 块太小)
-    const uint32_t ROWS_PER_DISP = (8u * 1024 * 1024) / (N * 4u);  // 8MB / 行字节数
-    uint32_t rpd = ROWS_PER_DISP < 32 ? 32 : (ROWS_PER_DISP > 4096 ? 4096 : ROWS_PER_DISP);
+    // VKBLAS_TRANSPOSE_BLK env 覆盖 行数/块 (实验)
+    uint32_t rpd;
+    const char* tbenv = getenv("VKBLAS_TRANSPOSE_BLK");
+    if (tbenv && *tbenv) {
+        rpd = (uint32_t)strtoul(tbenv, NULL, 10);
+    } else {
+        const uint32_t ROWS_PER_DISP = (8u * 1024 * 1024) / (N * 4u);
+        rpd = ROWS_PER_DISP < 32 ? 32 : (ROWS_PER_DISP > 4096 ? 4096 : ROWS_PER_DISP);
+    }
     for (uint32_t bo = 0; bo < batch; bo += 16) {
         pc.batch_base = bo;
         pc.batch = batch - bo < 16 ? batch - bo : 16;
@@ -1352,6 +1387,47 @@ static int run_gemm_sk(int use128, int variant, VkBuffer bA, size_t ba, VkBuffer
     return 0;
 }
 
+// matvec (M==1 decode): C(1×N) += A(1×K)·B, 免 B 全量转置
+// variant: 0 = B(K×N) 直读, 1 = B(N×K) 列读; 调用方持锁
+static int run_matvec(int variant, const void* A, size_t ba,
+                      const void* B, size_t bb, void* C, size_t bc,
+                      uint32_t K, uint32_t N, uint32_t ldb, uint32_t ldc,
+                      float alpha, float beta) {
+    if (g.mpipe[variant] == VK_NULL_HANDLE) return -1;
+    VkBuffer bA, bB, bC;
+    VkDeviceMemory mA, mB, mC;
+    VkDeviceSize oA, oB, oC;
+    if (import_ptr(A, ba, &bA, &mA, &oA) != 0) return -1;
+    if (import_ptr(B, bb, &bB, &mB, &oB) != 0) { release_ptr(mA, bA); return -1; }
+    if (import_ptr(C, bc, &bC, &mC, &oC) != 0) {
+        release_ptr(mA, bA); release_ptr(mB, bB); return -1;
+    }
+    (void)oA; (void)oB; (void)oC;
+
+    VkDescriptorBufferInfo db[3] = { {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t K, N, ldb, ldc; float alpha, beta; } pc = {
+        K, N, ldb, ldc, alpha, beta };
+
+    cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.mpipe[variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    uint32_t wg = variant == 0 ? (N + 1023) / 1024 : (N + 255) / 256;
+    vkCmdDispatch(g.cmd, wg, 1, 1);
+    cmd_end_submit("matvec submit");
+
+    release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+    return 0;
+}
+
 static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, void* C,
                     size_t ba, size_t bb, size_t bc,
                     uint32_t M, uint32_t N, uint32_t K,
@@ -1566,6 +1642,8 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
 
     int rc = 0;
     cmd_begin();
+    int profile = getenv("VKBLAS_PROFILE") != NULL;
+    uint64_t pt0 = profile ? now_us() : 0;
     if (op_b == VKBLAS_OP_N && g.tpipe != VK_NULL_HANDLE) {
         VkBuffer bBt = VK_NULL_HANDLE;
         uint32_t ldb_t = ldb;
@@ -1575,6 +1653,9 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
         } else {
             size_t bb_t = (size_t)batch * N * ldb_t * 4;
             cmd_barrier(bBt, bb_t);
+            if (profile)
+                fprintf(stderr, "[vkblas] prof: transpose rec took %.3fms\n", (now_us() - pt0) / 1e3);
+            uint64_t pt1 = profile ? now_us() : 0;
             int use128 = pick_tile128(M, N);
             if (use128)
                 rc = run_gemm_vk128(variant ^ 1, bA, ba_all, bBt, bb_t, bC, bc_all,
@@ -1613,6 +1694,22 @@ vkblas_status_t vkblas_gemm_f32(
     pthread_mutex_lock(&g.lock);
     ensure_init();
     if (!g.ready) { pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_INIT; }
+
+    // ---- M==1 decode 专用 matvec (免 B 全量转置; hipblas 翻译: M_vk=n) ----
+    // 条件: op_a=N (A 单行直读), batch==1 (单 token), matvec shader 可用
+    if (M == 1 && op_a == VKBLAS_OP_N && batch == 1 && g.mpipe[op_b] != VK_NULL_HANDLE) {
+        size_t ba_mv = (size_t)K * 4;  // A (1×K) 紧密
+        size_t bb_mv = (op_b == VKBLAS_OP_T) ? (size_t)(N - 1) * ldb + K
+                                             : (size_t)(K - 1) * ldb + N;
+        size_t bc_mv = (size_t)N * 4;  // C (1×N) 紧密
+        int mrc = run_matvec((int)op_b, A, ba_mv, B, bb_mv * 4, C, bc_mv,
+                             K, N, ldb, ldc, alpha, beta);
+        if (mrc == 0) {
+            pthread_mutex_unlock(&g.lock);
+            return VKBLAS_OK;
+        }
+        // import 失败 → 落回通用路径
+    }
 
     // buffer 大小按 shader 实际访问范围 (精确覆盖, 转置/直接读不同):
     //   TA=0 直接读 A[m*lda+k]:  max = (M-1)*lda + K-1

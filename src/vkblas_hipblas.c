@@ -8,6 +8,12 @@
 #include <dlfcn.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_runtime_api.h>
+#include <time.h>
+
+static double now_s(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 // ---------- 内部状态 ----------
 // 设计: hipblasCreate 直接返回真 hipblas handle (PyTorch 内部会用 RTLD_NEXT/句柄
@@ -178,13 +184,19 @@ static hipblasStatus_t vk_gemm_f32(hipblasHandle_t handle,
         fprintf(stderr, "[vk] gemm %s%s m=%d n=%d k=%d lda=%d ldb=%d\n",
                 transA == HIPBLAS_OP_T ? "T" : "N", transB == HIPBLAS_OP_T ? "T" : "N",
                 m, n, k, lda, ldb);
+    double t0 = now_s(), t1, t2;
     hipStreamSynchronize(g_stream);  // 等调用方 HIP 工作完成
+    t1 = now_s();
     vkblas_status_t st = vkblas_gemm_f32(
         transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         (uint32_t)n, (uint32_t)m, (uint32_t)k,
         a, BP, (uint32_t)ldb, AP, (uint32_t)lda, b, CP, (uint32_t)ldc,
         1, 0, 0, 0);
+    t2 = now_s();
+    if (getenv("VKBLAS_PROFILE"))
+        fprintf(stderr, "[vk] prof: entry=%.1fus hipSync=%.1fus vkblas=%.2fms total=%.2fms\n",
+                (t1 - t0) * 1e6, (t1 - t0) * 1e6, (t2 - t1) * 1e3, (t2 - t0) * 1e3);
     if (st != VKBLAS_OK) {  // import/init 失败 → 转发真 hipblas (handle 即真 handle)
         return FWD(hipblasSgemm, handle, transA, transB, m, n, k, alpha, AP, lda, BP, ldb, beta, CP, ldc);
     }
