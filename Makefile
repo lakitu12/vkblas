@@ -10,6 +10,8 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/matvec_n.spv $(SHADER_DIR)/matvec_t.spv \
           $(SHADER_DIR)/matvec_sk_n.spv $(SHADER_DIR)/matvec_sk_t.spv \
           $(SHADER_DIR)/matvec_sk_h16.spv $(SHADER_DIR)/matvec_sk_bf16.spv \
+          $(SHADER_DIR)/matvec_sk_m_h16.spv $(SHADER_DIR)/matvec_sk_m_bf16.spv \
+          $(SHADER_DIR)/split_k_reduce_m_h16.spv $(SHADER_DIR)/split_k_reduce_m_bf16.spv \
           $(SHADER_DIR)/split_k_reduce_h16.spv $(SHADER_DIR)/split_k_reduce_bf16.spv \
           $(SHADER_DIR)/gemm128_nn.spv $(SHADER_DIR)/gemm128_tn.spv \
           $(SHADER_DIR)/gemm128_nt.spv $(SHADER_DIR)/gemm128_tt.spv \
@@ -63,6 +65,15 @@ $(SHADER_DIR)/matvec_sk_h16.spv: $(SHADER_DIR)/matvec_sk_tmpl.comp
 	glslangValidator -V -DTB=0 -DHALF=1 $< -o $@
 $(SHADER_DIR)/matvec_sk_bf16.spv: $(SHADER_DIR)/matvec_sk_tmpl.comp
 	glslangValidator -V -DTB=0 -DHALF=2 $< -o $@
+# --- matvec_sk_m (M 行 decode split-k) ---
+$(SHADER_DIR)/matvec_sk_m_h16.spv: $(SHADER_DIR)/matvec_sk_m_tmpl.comp
+	glslangValidator -V -DHALF=1 $< -o $@
+$(SHADER_DIR)/matvec_sk_m_bf16.spv: $(SHADER_DIR)/matvec_sk_m_tmpl.comp
+	glslangValidator -V -DHALF=2 $< -o $@
+$(SHADER_DIR)/split_k_reduce_m_h16.spv: $(SHADER_DIR)/split_k_reduce_m.comp
+	glslangValidator -V -DHALF=1 $< -o $@
+$(SHADER_DIR)/split_k_reduce_m_bf16.spv: $(SHADER_DIR)/split_k_reduce_m.comp
+	glslangValidator -V -DHALF=2 $< -o $@
 $(SHADER_DIR)/split_k_reduce_h16.spv: $(SHADER_DIR)/split_k_reduce_h.comp
 	glslangValidator -V -DHALF=1 $< -o $@
 $(SHADER_DIR)/split_k_reduce_bf16.spv: $(SHADER_DIR)/split_k_reduce_h.comp

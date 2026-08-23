@@ -1,0 +1,58 @@
+#version 450
+// matvec_sk_m: M-row decode split-k pass1 — C_partial[seg][M][N] = Σ_k A[m][k]·B[k][n]
+// 每 wg 处理 R 行 (dispatch y = M/R), 每线程 2 列 → B 缓存 (K×N) 只读 M/R 次
+// (R=1 退化最初版; R 大 B 复用好但每线程串行长 — 用 VKBLAS_M_ROWS 实验)
+// HALF: 1=fp16 2=bf16 (A/B 2B 位模式 uint 数组, Sk 仍 fp32)
+// 并行度: wg = ceil(N/512) × ceil(M/R) × seg, 目标 ≥ 144
+#if HALF == 1
+float h2f(uint u, uint hb) {
+    vec2 v = unpackHalf2x16(u);
+    return hb == 0u ? v.x : v.y;
+}
+#elif HALF == 2
+float h2f(uint u, uint hb) { return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u); }
+#endif
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { uint A[]; };
+layout(set = 0, binding = 1) buffer B_buf { uint B[]; };
+layout(set = 0, binding = 2) buffer Sk_buf { float Sk[]; };
+
+layout(push_constant) uniform Params {
+    uint K, N, lda, ldb;   // A (M×K) 行步长, B (K×N) 行步长 (元素; 2B 时偶)
+    uint M, k_split, R;    // 总行数; 每 seg 的 K 跨度; 每 wg 行数
+    uint pad;
+} p;
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint seg = gl_WorkGroupID.z;      // K 段
+    uint m0 = gl_WorkGroupID.y * p.R; // 本 wg 首行
+    uint rmax = min(p.R, p.M - m0);   // 本 wg 实际行数
+    if (p.M <= m0) return;            // 越界 wg (M 不整除 R)
+    uint k_begin = seg * p.k_split;
+    uint k_end = min(p.K, k_begin + p.k_split);
+
+    // 每线程 2 列 (n0 偶, ldb 偶 → (k*ldb+n0)>>1 对齐 uint)
+    uint n0 = gl_WorkGroupID.x * 512 + tid * 2;
+    float acc0[16], acc1[16];
+    for (uint r = 0; r < 16; r++) { acc0[r] = 0.0; acc1[r] = 0.0; }
+    if (n0 + 1 < p.N) {
+        for (uint k = k_begin; k < k_end; k++) {
+            uint ub = B[((k * p.ldb + n0) >> 1)];
+            float b0 = h2f(ub, 0u), b1 = h2f(ub, 1u);
+            for (uint r = 0; r < rmax; r++) {
+                uint m = m0 + r;
+                uint aoff = (m * p.lda + k) >> 1;
+                float a = h2f(A[aoff], (m * p.lda + k) & 1u);
+                acc0[r] += a * b0;
+                acc1[r] += a * b1;
+            }
+        }
+        for (uint r = 0; r < rmax; r++) {
+            uint m = m0 + r;
+            Sk[(seg * p.M + m) * p.N + n0] = acc0[r];
+            Sk[(seg * p.M + m) * p.N + n0 + 1] = acc1[r];
+        }
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+// split_k_reduce_m: Sk[seg][M][N] fp32 → C[M][N] 2B 半精度 (M-row matvec reduce)
+// 每线程 2 列 (j0 偶) → 1 uint 对齐写; HALF: 1=fp16 2=bf16
+// dispatch: (ceil(N/512), ceil(M/256), 1)  — 每 wg 256 线程覆盖 (M 块 × N 全宽)
+#if HALF == 1
+uint f2h(float v) { return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu; }
+float h2f(uint u, uint hb) { return unpackHalf2x16(u)[hb]; }
+#else
+uint f2h(float v) { return floatBitsToUint(v) >> 16u; }
+float h2f(uint u, uint hb) { return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u); }
+#endif
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Sk_buf { float Sk[]; };
+layout(set = 0, binding = 1) buffer C_buf { uint C[]; };
+layout(push_constant) uniform Params {
+    uint N;         // 每行列数 (Sk 行步长)
+    uint k_num;     // split_k 段数
+    uint M;         // 行数
+    uint ldc;       // 2B 元素步长 (偶)
+    float alpha, beta;
+} p;
+
+void main() {
+    uint m = gl_GlobalInvocationID.y;
+    if (m >= p.M) return;
+    uint j0 = gl_GlobalInvocationID.x * 2;
+    if (j0 + 1 >= p.N) return;
+    float s0 = 0.0, s1 = 0.0;
+    // Sk 布局: [seg * M + m] 行, 每行 N 元素
+    for (uint k = 0; k < p.k_num; k++) {
+        uint base = (k * p.M + m) * p.N + j0;
+        s0 += Sk[base];
+        s1 += Sk[base + 1];
+    }
+    float c0 = 0.0, c1 = 0.0;
+    if (p.beta != 0.0) {
+        uint u = C[(m * p.ldc + j0) >> 1];  // ldc 偶, j0 偶
+        c0 = h2f(u, 0u); c1 = h2f(u, 1u);
+    }
+    C[(m * p.ldc + j0) >> 1] = f2h(p.alpha * s0 + p.beta * c0) |
+                               (f2h(p.alpha * s1 + p.beta * c1) << 16u);
+}
