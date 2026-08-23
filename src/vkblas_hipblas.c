@@ -541,7 +541,13 @@ static hipblasStatus_t vk_gemm_z64(hipblasHandle_t handle,
                                    const hipDoubleComplex* BP, int ldb,
                                    const hipDoubleComplex* beta, hipDoubleComplex* CP, int ldc) {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
+    // 2026-08-23: 真库 Zgemm 在 gfx803 复测健康 (16³ maxabsdiff 6.5e-14),
+    // vkblas d64 引擎复测算错 (maxabsdiff 159) — 反转优先级: 真库优先, vkblas 兜底
     hipStreamSynchronize(g_stream);
+    hipblasStatus_t rs = FWD(hipblasZgemm_v2, handle, transA, transB, m, n, k, alpha, AP, lda,
+                             BP, ldb, beta, CP, ldc);
+    if (rs == HIPBLAS_STATUS_SUCCESS) return HIPBLAS_STATUS_SUCCESS;
+    if (rs != HIPBLAS_STATUS_NOT_SUPPORTED) return rs;  // 其他错误 (无效参数等) 直接上报
     int st = vkblas_gemm_z64(
         transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
@@ -549,10 +555,7 @@ static hipblasStatus_t vk_gemm_z64(hipblasHandle_t handle,
         alpha->x, alpha->y, BP, (uint32_t)ldb, AP, (uint32_t)lda,
         beta->x, beta->y, CP, (uint32_t)ldc,
         1, 0, 0, 0);
-    if (st != 0) {  // 引擎不可用 → 转发真库
-        return FWD(hipblasZgemm_v2, handle, transA, transB, m, n, k, alpha, AP, lda,
-                   BP, ldb, beta, CP, ldc);
-    }
+    if (st != 0) return HIPBLAS_STATUS_NOT_SUPPORTED;  // 引擎也不可用
     return HIPBLAS_STATUS_SUCCESS;
 }
 
@@ -565,6 +568,10 @@ static hipblasStatus_t vk_gemm_strided_z64(hipblasHandle_t handle,
                                            int batchCount) {
     if (m <= 0 || n <= 0 || k <= 0 || batchCount <= 0) return HIPBLAS_STATUS_INVALID_VALUE;
     hipStreamSynchronize(g_stream);
+    hipblasStatus_t rs = FWD(hipblasZgemmStridedBatched_v2, handle, transA, transB, m, n, k,
+                             alpha, AP, lda, strideA, BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
+    if (rs == HIPBLAS_STATUS_SUCCESS) return HIPBLAS_STATUS_SUCCESS;
+    if (rs != HIPBLAS_STATUS_NOT_SUPPORTED) return rs;
     int st = vkblas_gemm_z64(
         transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
@@ -572,10 +579,7 @@ static hipblasStatus_t vk_gemm_strided_z64(hipblasHandle_t handle,
         alpha->x, alpha->y, BP, (uint32_t)ldb, AP, (uint32_t)lda,
         beta->x, beta->y, CP, (uint32_t)ldc,
         (uint32_t)batchCount, strideB, strideA, strideC);
-    if (st != 0) {
-        return FWD(hipblasZgemmStridedBatched_v2, handle, transA, transB, m, n, k,
-                   alpha, AP, lda, strideA, BP, ldb, strideB, beta, CP, ldc, strideC, batchCount);
-    }
+    if (st != 0) return HIPBLAS_STATUS_NOT_SUPPORTED;
     return HIPBLAS_STATUS_SUCCESS;
 }
 
