@@ -54,7 +54,7 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     size_t sk_buf_size;
     // B 转置缓存 (VKBLAS_CACHE_TRANSPOSE=1, 推理场景权重不变): key=(ptr,N,K,ldb)
     // 供 op_b==T && M==1 的 matvec 复用 (PyTorch decode: TB=1 256 路行流 6.4ms → TB=0 0.55ms)
-    struct tc_entry { const void* ptr; uint32_t N, K, ldb; const void* base;
+    struct tc_entry { const void* ptr; uint32_t N, K, ldb; int elem; const void* base;
                        VkBuffer b_kn; VkDeviceMemory m_kn;  // (K×N) 紧密 (TB=0 matvec 用)
                        VkBuffer b_nk; VkDeviceMemory m_nk; } tc_tab[4];
     int tc_cnt;
@@ -115,6 +115,9 @@ static void vk_check(VkResult r, const char* what) {
 }
 
 static uint64_t now_us(void);  // 定义见 bf16 计时段 (VKBLAS_PROFILE/TRACE 用)
+// B 转置缓存 (定义见后): elem=4/2, dtype=0/1 (2B 时)
+static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir, int elem,
+                  VkBuffer* out, size_t* out_size, int* built, int dtype);
 
 static void* load_hsa(void) {
     void* h = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_GLOBAL);
@@ -1232,11 +1235,35 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
                                                M, N, K, lda, ldb, ldc, 1,
                                                0, 0, 0, alpha, beta);
         } else if (pick_tile128(M, N)) {
-            rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
-                               M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
+            // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
+            int okt = 0;
+            if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+                VkBuffer bBt; size_t bt_sz; int tbuilt;
+                if (tc_get((const void*)pb, N, K, ldb, 0, 2, &bBt, &bt_sz, &tbuilt, dtype) == 0) {
+                    uint32_t ld_t = N + (N & 1u);
+                    okt = run_gemm_h128(dtype, variant ^ 1, bA, ba_e * 2, bBt, bt_sz, bC, bc_e * 2,
+                                        M, N, K, lda, ld_t, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                }
+            }
+            if (!okt) {
+                rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                   M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
+            }
         } else {
-            rc = run_gemm_h(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
-                            M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
+            // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
+            int okt = 0;
+            if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+                VkBuffer bBt; size_t bt_sz; int tbuilt;
+                if (tc_get((const void*)pb, N, K, ldb, 0, 2, &bBt, &bt_sz, &tbuilt, dtype) == 0) {
+                    uint32_t ld_t = N + (N & 1u);
+                    okt = run_gemm_h(dtype, variant ^ 1, bA, ba_e * 2, bBt, bt_sz, bC, bc_e * 2,
+                                     M, N, K, lda, ld_t, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                }
+            }
+            if (!okt) {
+                rc = run_gemm_h(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
+            }
         }
         release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
         if (trace)
@@ -1609,14 +1636,15 @@ static int run_matvec_sk_vk(int variant, const void* A, size_t ba,
 // dir=1 → (N×K) 紧密 (TB=1 GEMM 用, 输入 (K×N,ldb))
 // VKBLAS_CACHE_TRANSPOSE=1 启用; 推理场景权重不变才安全
 // 返回 0 且 *out 有效; -1 失败 (调用方走原路径)
-static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir,
-                  VkBuffer* out, size_t* out_size, int* built) {
+// elem: 4 (fp32) 或 2 (fp16/bf16); dtype: 0=fp16 1=bf16 (elem==2 时用)
+static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir, int elem,
+                  VkBuffer* out, size_t* out_size, int* built, int dtype) {
     *built = 0;
     for (int i = 0; i < g.tc_cnt; i++) {
         if (g.tc_tab[i].ptr == ptr && g.tc_tab[i].N == N &&
-            g.tc_tab[i].K == K && g.tc_tab[i].ldb == ldb) {
+            g.tc_tab[i].K == K && g.tc_tab[i].ldb == ldb && g.tc_tab[i].elem == elem) {
             VkBuffer b = dir == 0 ? g.tc_tab[i].b_kn : g.tc_tab[i].b_nk;
-            if (b != VK_NULL_HANDLE) { *out = b; *out_size = (size_t)N * K * 4; return 0; }
+            if (b != VK_NULL_HANDLE) { *out = b; *out_size = (size_t)N * K * elem; return 0; }
             break;  // 条目存在但该方向未构建 → 构建
         }
     }
@@ -1631,9 +1659,9 @@ static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir
     // 输入布局: dir=0 → In (N×K, ldb); dir=1 → In (K×N, ldb)
     size_t bb = dir == 0 ? (size_t)(N - 1) * ldb + K : (size_t)(K - 1) * ldb + N;
     VkBuffer bIn; VkDeviceMemory mIn; VkDeviceSize oIn;
-    if (import_ptr(ptr, bb * 4, &bIn, &mIn, &oIn) != 0) return -1;
+    if (import_ptr(ptr, bb * elem, &bIn, &mIn, &oIn) != 0) return -1;
     const void* cbase = ic_block_base(ptr);
-    const size_t need = (size_t)N * K * 4;
+    const size_t need = (size_t)N * K * elem;
     // 分配输出 (两方向都要: 转一个, 另一个从它再转)
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = need, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1662,22 +1690,37 @@ static int tc_get(const void* ptr, uint32_t N, uint32_t K, uint32_t ldb, int dir
         // 两次转置必须独立 submit: transpose_into 共用 g.tdset, 连续录制会让
         // 前一个 dispatch 读到后一个的绑定 (descriptor 立即生效)
         uint32_t ldout0 = 0;
-        cmd_begin();
-        if (dir == 0)
-            transpose_into(bIn, bb * 4, bT0, need, N, K, ldb, &ldout0, 1, 0, 0, 0);
-        else
-            transpose_into(bIn, bb * 4, bT0, need, K, N, ldb, &ldout0, 1, 0, 0, 0);
-        cmd_end_submit("tc build t0 submit");
-        ldout0 = 0;
-        cmd_begin();
-        transpose_into(bT0, need, bT1, need, dir == 0 ? K : N, dir == 0 ? N : K,
-                       dir == 0 ? N : K, &ldout0, 1, 0, 0, 0);
-        cmd_end_submit("tc build t1 submit");
+        if (elem == 4) {
+            cmd_begin();
+            if (dir == 0)
+                transpose_into(bIn, bb * elem, bT0, need, N, K, ldb, &ldout0, 1, 0, 0, 0);
+            else
+                transpose_into(bIn, bb * elem, bT0, need, K, N, ldb, &ldout0, 1, 0, 0, 0);
+            cmd_end_submit("tc build t0 submit");
+            ldout0 = 0;
+            cmd_begin();
+            transpose_into(bT0, need, bT1, need, dir == 0 ? K : N, dir == 0 ? N : K,
+                           dir == 0 ? N : K, &ldout0, 1, 0, 0, 0);
+            cmd_end_submit("tc build t1 submit");
+        } else {
+            // 2B: transpose_h; 输出行步长 pad 偶 (K/N + (K/N)&1)
+            cmd_begin();
+            if (dir == 0)
+                transpose_h_into(bIn, bb * elem, bT0, need, N, K, ldb, &ldout0, dtype, 1, 0, 0, 0);
+            else
+                transpose_h_into(bIn, bb * elem, bT0, need, K, N, ldb, &ldout0, dtype, 1, 0, 0, 0);
+            cmd_end_submit("tc build t0 submit");
+            ldout0 = 0;
+            cmd_begin();
+            transpose_h_into(bT0, need, bT1, need, dir == 0 ? K : N, dir == 0 ? N : K,
+                             dir == 0 ? N : K, &ldout0, dtype, 1, 0, 0, 0);
+            cmd_end_submit("tc build t1 submit");
+        }
     }
     release_ptr(mIn, bIn);
     {
         struct tc_entry* e = &g.tc_tab[g.tc_cnt++];
-        e->ptr = ptr; e->N = N; e->K = K; e->ldb = ldb; e->base = cbase;
+        e->ptr = ptr; e->N = N; e->K = K; e->ldb = ldb; e->elem = elem; e->base = cbase;
         if (dir == 0) { e->b_kn = bT0; e->m_kn = mT0; e->b_nk = bT1; e->m_nk = mT1; }
         else          { e->b_nk = bT0; e->m_nk = mT0; e->b_kn = bT1; e->m_kn = mT1; }
         *out = dir == 0 ? e->b_kn : e->b_nk;
@@ -1904,6 +1947,98 @@ static int run_matvec_sk_h(int dtype, const void* A, size_t ba,
     cmd_end_submit("matvec half split-k submit");
 
     release_ptr(mA, bA); release_ptr(mB, bB); release_ptr(mC, bC);
+    return 0;
+}
+
+// matvec split-k half, B 直接 VkBuffer (转置缓存): 同 run_matvec_sk_h
+static int run_matvec_sk_h_vk(int dtype, const void* A, size_t ba,
+                              VkBuffer bB, VkBuffer bC, size_t bc,
+                              uint32_t K, uint32_t N, uint32_t ldb, uint32_t ldc,
+                              float alpha, float beta) {
+    VkPipeline p1 = g.mpipe[4 + dtype];
+    VkPipeline p2 = g.rhpipe[dtype];
+    if (p1 == VK_NULL_HANDLE || p2 == VK_NULL_HANDLE) return -1;
+    VkBuffer bA; VkDeviceMemory mA; VkDeviceSize oA;
+    if (import_ptr(A, ba, &bA, &mA, &oA) != 0) return -1;
+    (void)oA;
+    uint32_t Nt = (N + 511) / 512;
+    uint32_t seg = 144 / Nt + 1;
+    if (seg < 2) seg = 2;
+    if (seg > 64) seg = 64;
+    size_t need = (size_t)seg * N * 4;
+    if (g.sk_buf == VK_NULL_HANDLE || need > g.sk_buf_size) {
+        if (g.sk_buf != VK_NULL_HANDLE) {
+            vkFreeMemory(g.dev, g.sk_mem, NULL);
+            vkDestroyBuffer(g.dev, g.sk_buf, NULL);
+        }
+        VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = need, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        if (vkCreateBuffer(g.dev, &bci, NULL, &g.sk_buf) != VK_SUCCESS) {
+            release_ptr(mA, bA); return -1;
+        }
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(g.dev, g.sk_buf, &mr);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mr.size };
+        VkPhysicalDeviceMemoryProperties mprops;
+        vkGetPhysicalDeviceMemoryProperties(g.phys, &mprops);
+        for (uint32_t t = 0; t < mprops.memoryTypeCount; t++) {
+            if (mr.memoryTypeBits & (1u << t) &&
+                (mprops.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                mai.memoryTypeIndex = t; break;
+            }
+        }
+        if (vkAllocateMemory(g.dev, &mai, NULL, &g.sk_mem) != VK_SUCCESS ||
+            vkBindBufferMemory(g.dev, g.sk_buf, g.sk_mem, 0) != VK_SUCCESS) {
+            release_ptr(mA, bA); return -1;
+        }
+        g.sk_buf_size = need;
+    }
+    uint32_t k_split = (K + seg - 1) / seg;
+    cmd_begin();
+    {
+        VkDescriptorBufferInfo db[3] = { {bA, 0, ba}, {bB, 0, (size_t)N * K * 2}, {g.sk_buf, 0, need} };
+        VkWriteDescriptorSet wds[3];
+        for (int i = 0; i < 3; i++) {
+            wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+        }
+        vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+        struct { uint32_t K, N, ldb, k_split, pad; } pc = { K, N, ldb, k_split, 0 };
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p1);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+        vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g.cmd, Nt, 1, seg);
+        VkBufferMemoryBarrier bmb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = g.sk_buf, .offset = 0, .size = need };
+        vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bmb, 0, NULL);
+    }
+    {
+        VkDescriptorBufferInfo db[2] = { {g.sk_buf, 0, need}, {bC, 0, bc} };
+        VkWriteDescriptorSet wds[2];
+        for (int i = 0; i < 2; i++) {
+            wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = g.tdset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+        }
+        vkUpdateDescriptorSets(g.dev, 2, wds, 0, NULL);
+        struct { uint32_t ne, k_num, N, ldc; float alpha, beta; } pc2 = {
+            N, seg, N, ldc, alpha, beta };
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p2);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.tpl, 0, 1, &g.tdset, 0, NULL);
+        vkCmdPushConstants(g.cmd, g.tpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+        vkCmdDispatch(g.cmd, (N / 2 + 255) / 256, 1, 1);
+    }
+    cmd_end_submit("matvec half cached submit");
+    release_ptr(mA, bA);
     return 0;
 }
 
@@ -2193,7 +2328,7 @@ vkblas_status_t vkblas_gemm_f32(
         if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL &&
             g.mpipe[0] != VK_NULL_HANDLE) {
             VkBuffer bBt; size_t bt_sz; int built;
-            if (tc_get(B, N, K, ldb, 0, &bBt, &bt_sz, &built) == 0)
+            if (tc_get(B, N, K, ldb, 0, 4, &bBt, &bt_sz, &built, 0) == 0)
                 mrc = run_matvec_sk_vk(0, A, ba_mv, bBt, bt_sz, C, bc_mv,
                                        K, N, N, ldc, alpha, beta);
             else
@@ -2292,7 +2427,7 @@ vkblas_status_t vkblas_gemm_f32(
             // VKBLAS_CACHE_TRANSPOSE: B (K×N,ldb) → (N×K) 紧密缓存 (推理权重不变)
             if (batch == 1 && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
                 VkBuffer bBt; size_t bt_sz; int tbuilt;
-                if (tc_get((const void*)pb, N, K, ldb, 1, &bBt, &bt_sz, &tbuilt) == 0) {
+                if (tc_get((const void*)pb, N, K, ldb, 1, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
                     // 用缓存转置直接跑 GEMM (TB=1, ldb_t=N 紧密)
                     if (use128)
                         frc = run_gemm_vk128(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
@@ -2336,7 +2471,7 @@ vkblas_status_t vkblas_gemm_f32(
             int okt = 0;
             if (batch == 1 && op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
                 VkBuffer bBt; size_t bt_sz; int tbuilt;
-                if (tc_get((const void*)pb, N, K, ldb, 0, &bBt, &bt_sz, &tbuilt) == 0) {
+                if (tc_get((const void*)pb, N, K, ldb, 0, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
                     VkBuffer bA3, bC3; VkDeviceMemory mA3, mC3; VkDeviceSize oA3, oC3;
                     if (import_ptr(pa, ba, &bA3, &mA3, &oA3) == 0 &&
                         import_ptr(pc, bc, &bC3, &mC3, &oC3) == 0) {
@@ -2385,13 +2520,27 @@ vkblas_status_t vkblas_gemm_bf16(
     }
 
     // ---- M==1 decode 专用 matvec (免 B 转置; bf16 2B 元素) ----
-    if (M == 1 && op_a == VKBLAS_OP_N && op_b == VKBLAS_OP_N && batch == 1 &&
-        (ldc & 1u) == 0 && (ldb & 1u) == 0 && (N & 1u) == 0 &&
-        g.mpipe[5] != VK_NULL_HANDLE) {
+    if (M == 1 && op_a == VKBLAS_OP_N && batch == 1 &&
+        (ldc & 1u) == 0 && (ldb & 1u) == 0 && (N & 1u) == 0 && g.mpipe[5] != VK_NULL_HANDLE) {
         size_t ba_h = (size_t)K * 2;
-        size_t bb_h = ((size_t)(K - 1) * ldb + N) * 2;
         size_t bc_h = (size_t)N * 2;
-        int hrc = run_matvec_sk_h(1, A, ba_h, B, bb_h, C, bc_h, K, N, ldb, ldc, alpha, beta);
+        int hrc = -1;
+        if (op_b == VKBLAS_OP_N) {
+            size_t bb_h = ((size_t)(K - 1) * ldb + N) * 2;
+            hrc = run_matvec_sk_h(1, A, ba_h, B, bb_h, C, bc_h, K, N, ldb, ldc, alpha, beta);
+        } else if (getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+            // op_b==T: 权重转置缓存 → TB=0 matvec
+            VkBuffer bBt; size_t bt_sz; int tbuilt;
+            if (tc_get(B, N, K, ldb, 0, 2, &bBt, &bt_sz, &tbuilt, 1) == 0) {
+                VkBuffer bCv; VkDeviceMemory mCv; VkDeviceSize oCv;
+                if (import_ptr(C, bc_h, &bCv, &mCv, &oCv) == 0) {
+                    (void)oCv;
+                    hrc = run_matvec_sk_h_vk(1, A, ba_h, bBt, bCv, bc_h,
+                                             K, N, N + (N & 1u), ldc, alpha, beta);
+                    release_ptr(mCv, bCv);
+                }
+            }
+        }
         if (hrc == 0) {
             pthread_mutex_unlock(&g.lock);
             return VKBLAS_OK;
@@ -2512,13 +2661,26 @@ vkblas_status_t vkblas_gemm_f16(
     }
 
     // ---- M==1 decode 专用 matvec (f16 2B 元素) ----
-    if (M == 1 && op_a == VKBLAS_OP_N && op_b == VKBLAS_OP_N && batch == 1 &&
-        (ldc & 1u) == 0 && (ldb & 1u) == 0 && (N & 1u) == 0 &&
-        g.mpipe[4] != VK_NULL_HANDLE) {
+    if (M == 1 && op_a == VKBLAS_OP_N && batch == 1 &&
+        (ldc & 1u) == 0 && (ldb & 1u) == 0 && (N & 1u) == 0 && g.mpipe[4] != VK_NULL_HANDLE) {
         size_t ba_h = (size_t)K * 2;
-        size_t bb_h = ((size_t)(K - 1) * ldb + N) * 2;
         size_t bc_h = (size_t)N * 2;
-        int hrc = run_matvec_sk_h(0, A, ba_h, B, bb_h, C, bc_h, K, N, ldb, ldc, alpha, beta);
+        int hrc = -1;
+        if (op_b == VKBLAS_OP_N) {
+            size_t bb_h = ((size_t)(K - 1) * ldb + N) * 2;
+            hrc = run_matvec_sk_h(0, A, ba_h, B, bb_h, C, bc_h, K, N, ldb, ldc, alpha, beta);
+        } else if (getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+            VkBuffer bBt; size_t bt_sz; int tbuilt;
+            if (tc_get(B, N, K, ldb, 0, 2, &bBt, &bt_sz, &tbuilt, 0) == 0) {
+                VkBuffer bCv; VkDeviceMemory mCv; VkDeviceSize oCv;
+                if (import_ptr(C, bc_h, &bCv, &mCv, &oCv) == 0) {
+                    (void)oCv;
+                    hrc = run_matvec_sk_h_vk(0, A, ba_h, bBt, bCv, bc_h,
+                                             K, N, N + (N & 1u), ldc, alpha, beta);
+                    release_ptr(mCv, bCv);
+                }
+            }
+        }
         if (hrc == 0) {
             pthread_mutex_unlock(&g.lock);
             return VKBLAS_OK;
