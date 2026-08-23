@@ -665,16 +665,24 @@ static void release_ptr(VkDeviceMemory mem, VkBuffer buf) {
     vkFreeMemory(g.dev, mem, NULL);
 }
 
-// v7-128 tile 适用性 (VKBLAS_TILE128=1, 所有 GEMM 路径统一入口):
-//   128×128 tile 在 M,N≥256 时快 5-36%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度;
-//   本机实测 (gfx803, TT 布局, vk row-major 视角) v7 在 "M≫N 且 tiles>24 (无 split-k)"
-//   的长条大形状反输 v6: (8192,512) v7 14.5ms vs v6 12.6ms; (4096,1024) 14.5 vs 13.3
-//   → 回落 v6; 反之 M≪N 时 v7 大胜 ((512,8192) 10.9 vs 14.5) 保持 v7
+// v7-128 tile 适用性 (所有 GEMM 路径统一入口):
+//   128×128 tile 在 M,N≥256 时快 5-76%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度;
+//   NN 实测定界 (gfx803, 2026-08-23):
+//     方阵/近方阵: v7 多数胜 (1.05-1.07x), 大方阵 v6 略快 (0.97-0.99x)
+//     M<N (高瘦): v7 胜或持平 (0.90-1.07x), batch 大时 (bs512) v6 更优 (0.90x)
+//     M>N 窄 N (Nt≤4) + Mt≤32 + tiles≥128: v6 胜 (0.81x) — 仅 (4096,512) 边界
+//     其余 M>N 窄 N: v7 大胜 (1.13-3.29x)
+//   环境变量 VKBLAS_TILE128=0/1 强制覆盖 (调试/对比)
 static int pick_tile128(uint32_t M, uint32_t N) {
-    if (getenv("VKBLAS_TILE128") == NULL) return 0;
+    const char* env = getenv("VKBLAS_TILE128");
+    if (env != NULL) {
+        if (env[0] == '0' && env[1] == '\0') return 0;
+        if (env[0] == '1' && env[1] == '\0') return 1;
+    }
     if (M < 256 || N < 256) return 0;
     uint32_t Mt = (M + 127) / 128, Nt = (N + 127) / 128;
-    if (Mt * Nt > 24 && M > N) return 0;
+    // M>N 窄 N: v7 workgroup 数少 → 占用率不足; 仅在 (4096,512) 边界 v6 胜
+    if (M > N && Nt <= 4 && Mt * Nt >= 128 && Mt <= 32) return 0;
     return 1;
 }
 

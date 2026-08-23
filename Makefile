@@ -163,6 +163,10 @@ test/test_gemm: test/test_gemm.c src/vkblas.h libvkblas_hipblas.so
 test/test_h: test/test_h.c src/vkblas.h libvkblas_hipblas.so
 	$(CC) $(CFLAGS) -o $@ test/test_h.c -lamdhip64 $(LDFLAGS)
 
+# v6/v7 tile 对比扫描 (同一进程内切 VKBLAS_TILE128, CPU 参考校验 + best-of-3)
+test/bench_shapes: test/bench_shapes.c libvkblas_hipblas.so
+	$(CC) $(CFLAGS) -o $@ test/bench_shapes.c -lhipblas -lamdhip64 $(LDFLAGS)
+
 # import 缓存 (hit 路径) 回归 — 必须 LD_PRELOAD 运行 (hook 自证实才启用缓存):
 #   LD_PRELOAD=$PWD/libvkblas_hipblas.so ./test/test_cache
 test/test_cache: test/test_cache.c src/vkblas.h libvkblas_hipblas.so
