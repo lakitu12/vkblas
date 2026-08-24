@@ -116,3 +116,11 @@ src/shaders/transpose.comp   row-major → column-major transpose
 test/test_gemm.c        C-level correctness (CPU reference)
 test/test_torch.py      PyTorch end-to-end + perf
 ```
+
+## License
+
+Dual-licensed under **MIT OR Apache-2.0** (SPDX: `MIT OR Apache-2.0`) — you may
+use this project under either license, at your option.
+
+- [LICENSE-MIT](LICENSE-MIT) — MIT License
+- [LICENSE-APACHE](LICENSE-APACHE) — Apache License 2.0
