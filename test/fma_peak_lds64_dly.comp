@@ -1,0 +1,78 @@
+#version 450
+// fma_peak_lds64_dly.comp — 扫 ds→使用距离 (USE_DELAY 宏): 找延迟墙拐点
+// 每轮固定 96 FMA: USE_DELAY 条无关 + 8 条用 ds + (88-USE_DELAY) 条无关
+// ds 地址随轮变 (防 LICM)
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out_buf { uint O[]; };
+shared vec2 L[1024];
+layout(push_constant) uniform Params { uint rounds; uint pad; } p;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65536u;
+    uint lt = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 64u;
+    float x = float(tid & 0xFF) * 1e-6 + 1.0f;
+    for (int i = 0; i < 4; i++) L[lt + i * 256u] = vec2(x + float(i), x * 0.5f + float(i));
+    barrier();
+    float b[96];
+    for (int i = 0; i < 96; i++) b[i] = x + float(i) * 1e-7f;
+    for (uint r = 0; r < p.rounds; r++) {
+        uint a0 = (lt & 15u) * 2u + (lt >> 4) * 32u;
+        uint ab = (a0 + ((r & 7u) * 512u)) % 1024u;
+        vec2 d0 = L[ab % 1024u];
+        vec2 d1 = L[(ab + 64u) % 1024u];
+        vec2 d2 = L[(ab + 128u) % 1024u];
+        vec2 d3 = L[(ab + 192u) % 1024u];
+        vec2 d4 = L[(ab + 256u) % 1024u];
+        vec2 d5 = L[(ab + 320u) % 1024u];
+        vec2 d6 = L[(ab + 384u) % 1024u];
+        vec2 d7 = L[(ab + 448u) % 1024u];
+#if USE_DELAY >= 96
+        for (int i = 0; i < 96; i++) b[i] = fma(b[i], x, b[(i + 17) % 96]);
+        b[0] = fma(b[0], d0.x, d0.y);
+        b[1] = fma(b[1], d1.x, d1.y);
+        b[2] = fma(b[2], d2.x, d2.y);
+        b[3] = fma(b[3], d3.x, d3.y);
+        b[4] = fma(b[4], d4.x, d4.y);
+        b[5] = fma(b[5], d5.x, d5.y);
+        b[6] = fma(b[6], d6.x, d6.y);
+        b[7] = fma(b[7], d7.x, d7.y);
+#elif USE_DELAY >= 64
+        for (int i = 0; i < 64; i++) b[i] = fma(b[i], x, b[(i + 17) % 96]);
+        b[0] = fma(b[0], d0.x, d0.y);
+        b[1] = fma(b[1], d1.x, d1.y);
+        b[2] = fma(b[2], d2.x, d2.y);
+        b[3] = fma(b[3], d3.x, d3.y);
+        b[4] = fma(b[4], d4.x, d4.y);
+        b[5] = fma(b[5], d5.x, d5.y);
+        b[6] = fma(b[6], d6.x, d6.y);
+        b[7] = fma(b[7], d7.x, d7.y);
+        for (int i = 0; i < 24; i++) b[(i + 8) % 96] = fma(b[(i + 8) % 96], x, b[(i + 25) % 96]);
+#elif USE_DELAY >= 48
+        for (int i = 0; i < 48; i++) b[i] = fma(b[i], x, b[(i + 17) % 96]);
+        b[0] = fma(b[0], d0.x, d0.y);
+        b[1] = fma(b[1], d1.x, d1.y);
+        b[2] = fma(b[2], d2.x, d2.y);
+        b[3] = fma(b[3], d3.x, d3.y);
+        b[4] = fma(b[4], d4.x, d4.y);
+        b[5] = fma(b[5], d5.x, d5.y);
+        b[6] = fma(b[6], d6.x, d6.y);
+        b[7] = fma(b[7], d7.x, d7.y);
+        for (int i = 0; i < 40; i++) b[(i + 8) % 96] = fma(b[(i + 8) % 96], x, b[(i + 29) % 96]);
+#else
+        for (int i = 0; i < USE_DELAY; i++) b[i] = fma(b[i], x, b[(i + 17) % 96]);
+        b[0] = fma(b[0], d0.x, d0.y);
+        b[1] = fma(b[1], d1.x, d1.y);
+        b[2] = fma(b[2], d2.x, d2.y);
+        b[3] = fma(b[3], d3.x, d3.y);
+        b[4] = fma(b[4], d4.x, d4.y);
+        b[5] = fma(b[5], d5.x, d5.y);
+        b[6] = fma(b[6], d6.x, d6.y);
+        b[7] = fma(b[7], d7.x, d7.y);
+        for (int i = 0; i < 88 - USE_DELAY; i++)
+            b[(i + USE_DELAY + 8) % 96] = fma(b[(i + USE_DELAY + 8) % 96], x, b[(i + 31) % 96]);
+#endif
+    }
+    float s = 0.0f;
+    for (int i = 0; i < 96; i++) s += b[i];
+    O[gl_GlobalInvocationID.x] = floatBitsToUint(s);
+}

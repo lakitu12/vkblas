@@ -1,0 +1,56 @@
+#version 450
+// fma_peak_lds64_pf.comp — 验证 ACO 是否会重排"跨轮预取" (提前量 64 FMA)
+// 每轮: 64 FMA 用上一轮的 8 个 vec2 读值; 轮尾发 8 ds (下一轮用)
+// 若 ACO 保留此结构且性能 ~满速 → 手写流水有效; 若重排回"读→立即用" → ACO 调度墙
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out_buf { uint O[]; };
+shared vec2 L[1024];
+layout(push_constant) uniform Params { uint rounds; uint pad; } p;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65536u;
+    uint lt = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 64u;
+    float x = float(tid & 0xFF) * 1e-6 + 1.0f;
+    for (int i = 0; i < 4; i++) L[lt + i * 256u] = vec2(x + float(i), x * 0.5f + float(i));
+    barrier();
+    float b[64];
+    for (int i = 0; i < 64; i++) b[i] = x + float(i) * 1e-7f;
+    // prologue: 读轮 0 数据
+    uint a0 = (lt & 15u) * 2u + (lt >> 4) * 32u;
+    vec2 d0 = L[a0 % 1024u];
+    vec2 d1 = L[(a0 + 64u) % 1024u];
+    vec2 d2 = L[(a0 + 128u) % 1024u];
+    vec2 d3 = L[(a0 + 192u) % 1024u];
+    vec2 d4 = L[(a0 + 256u) % 1024u];
+    vec2 d5 = L[(a0 + 320u) % 1024u];
+    vec2 d6 = L[(a0 + 384u) % 1024u];
+    vec2 d7 = L[(a0 + 448u) % 1024u];
+    for (uint r = 0; r < p.rounds; r++) {
+        // 每轮地址换行 (防 LICM): L[(a0 + (r&7)*512 + off) % 1024]
+        uint ab = (a0 + ((r & 7u) * 512u)) % 1024u;
+        // 64 FMA 用上一轮读的值 (真实依赖)
+        b[0] = fma(b[0], d0.x, d0.y);
+        b[1] = fma(b[1], d1.x, d1.y);
+        b[2] = fma(b[2], d2.x, d2.y);
+        b[3] = fma(b[3], d3.x, d3.y);
+        b[4] = fma(b[4], d4.x, d4.y);
+        b[5] = fma(b[5], d5.x, d5.y);
+        b[6] = fma(b[6], d6.x, d6.y);
+        b[7] = fma(b[7], d7.x, d7.y);
+        for (int i = 0; i < 64; i++) b[i] = fma(b[i], x, b[(i + 17) % 64]);
+        // 轮尾: 预取下一轮 (提前量 = 64 FMA)
+        vec2 n0 = L[ab % 1024u];
+        vec2 n1 = L[(ab + 64u) % 1024u];
+        vec2 n2 = L[(ab + 128u) % 1024u];
+        vec2 n3 = L[(ab + 192u) % 1024u];
+        vec2 n4 = L[(ab + 256u) % 1024u];
+        vec2 n5 = L[(ab + 320u) % 1024u];
+        vec2 n6 = L[(ab + 384u) % 1024u];
+        vec2 n7 = L[(ab + 448u) % 1024u];
+        d0 = n0; d1 = n1; d2 = n2; d3 = n3;
+        d4 = n4; d5 = n5; d6 = n6; d7 = n7;
+    }
+    float s = 0.0f;
+    for (int i = 0; i < 64; i++) s += b[i];
+    O[gl_GlobalInvocationID.x] = floatBitsToUint(s);
+}
