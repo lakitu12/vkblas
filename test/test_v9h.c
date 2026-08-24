@@ -1,6 +1,6 @@
 // test_v9h.c — v9h 2B 直通正确性验证 (经 hipblasGemmEx 公开入口, 与 PyTorch 同路)
 // 对比 CPU fp32 参考 (从 2B 位模式精确展开); bf16 容差用相对误差 (固有 0.4%)
-// 用法: ./test_v9h   (VKBLAS_V9H=1 开/关 由外部 env 控制)
+// 用法: ./test_v9h   (v9h 为 128-tile 直通默认实现, 无需 env)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
