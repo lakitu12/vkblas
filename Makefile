@@ -35,6 +35,10 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm128_h16_nt.spv $(SHADER_DIR)/gemm128_h16_tt.spv \
           $(SHADER_DIR)/gemm128_b16_nn.spv $(SHADER_DIR)/gemm128_b16_tn.spv \
           $(SHADER_DIR)/gemm128_b16_nt.spv $(SHADER_DIR)/gemm128_b16_tt.spv \
+          $(SHADER_DIR)/gemm128v9h_h16_nn.spv $(SHADER_DIR)/gemm128v9h_h16_tn.spv \
+          $(SHADER_DIR)/gemm128v9h_h16_nt.spv $(SHADER_DIR)/gemm128v9h_h16_tt.spv \
+          $(SHADER_DIR)/gemm128v9h_b16_nn.spv $(SHADER_DIR)/gemm128v9h_b16_tn.spv \
+          $(SHADER_DIR)/gemm128v9h_b16_nt.spv $(SHADER_DIR)/gemm128v9h_b16_tt.spv \
           $(SHADER_DIR)/transpose_h16.spv $(SHADER_DIR)/transpose_b16.spv \
           $(SHADER_DIR)/gemm_sk_nn.spv $(SHADER_DIR)/gemm_sk_tn.spv \
           $(SHADER_DIR)/gemm_sk_nt.spv $(SHADER_DIR)/gemm_sk_tt.spv \
@@ -204,6 +208,23 @@ $(SHADER_DIR)/gemm128_b16_tn.spv: $(SHADER_DIR)/gemm_tmpl_128_h.comp
 $(SHADER_DIR)/gemm128_b16_nt.spv: $(SHADER_DIR)/gemm_tmpl_128_h.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
 $(SHADER_DIR)/gemm128_b16_tt.spv: $(SHADER_DIR)/gemm_tmpl_128_h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
+# --- gemm v9h 128×128 2B 直通 (v9 无冲突主循环; VKBLAS_V9H=1 启用) ---
+$(SHADER_DIR)/gemm128v9h_h16_nn.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v9h_h16_tn.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v9h_h16_nt.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v9h_h16_tt.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v9h_b16_nn.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v9h_b16_tn.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v9h_b16_nt.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v9h_b16_tt.spv: $(SHADER_DIR)/gemm_tmpl_128_v9h.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/transpose_h16.spv: $(SHADER_DIR)/transpose_h.comp
 	glslangValidator -V -DHALF_TYPE=1 $< -o $@

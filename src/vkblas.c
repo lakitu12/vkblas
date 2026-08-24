@@ -44,6 +44,7 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 64 acc/线程
     VkPipeline pipe128x64[4]; // v8: 128×64 tile, BK16, 32 acc/线程 (VKBLAS_V8=1 启用, 修 VGPR 占用+LDS 冲突)
     VkPipeline pipe128v9[4]; // v9: 128×128 + v8 无冲突读 (64 acc; VKBLAS_V9=1 启用)
+    VkPipeline pipe128v9h[2][4]; // v9h: 2B 直通 + v9 无冲突读 (VKBLAS_V9H=1 启用)
     VkPipeline pipe128v10h[2][4]; // v10h: 128×128 2B 真打包 LDS 直通 (VKBLAS_V10H=1 启用)
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
     // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
@@ -307,6 +308,22 @@ static void init_vkblas(void) {
             .layout = g.pl };
         vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cp9, NULL, &g.pipe128v9[i]), "pipeline128v9");
         vkDestroyShaderModule(g.dev, sm, NULL);
+    }
+    // v9h 2B 直通 (v7h load/写 C + v9 无冲突主循环; VKBLAS_V9H=1 启用)
+    static const char* h128v9hnames[2][4] = {
+        { "gemm128v9h_h16_nn.spv", "gemm128v9h_h16_nt.spv", "gemm128v9h_h16_tn.spv", "gemm128v9h_h16_tt.spv" },
+        { "gemm128v9h_b16_nn.spv", "gemm128v9h_b16_nt.spv", "gemm128v9h_b16_tn.spv", "gemm128v9h_b16_tt.spv" } };
+    for (int d = 0; d < 2; d++) {
+        for (int i = 0; i < 4; i++) {
+            g.pipe128v9h[d][i] = VK_NULL_HANDLE;
+            if (load_spv(h128v9hnames[d][i], &sm) != 0) continue;
+            VkComputePipelineCreateInfo hp9 = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                           VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                .layout = g.pl };
+            vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp9, NULL, &g.pipe128v9h[d][i]), "h128v9h pipe");
+            vkDestroyShaderModule(g.dev, sm, NULL);
+        }
     }
 
     VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 72 };  // GEMM 3+转置 2+cvt 8×2+实例 8×2+cx 2×3+cmb 4+cz 3+cm64 4
@@ -1088,7 +1105,11 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
                          uint32_t lda, uint32_t ldb, uint32_t ldc,
                          uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                          float alpha, float beta, int submit) {
-    if (g.pipe128_h[dtype][variant] == VK_NULL_HANDLE) return -1;
+    // v9h: 同一 push/dispatch 契约的 2B 直通变体 (v9 无冲突主循环), env 切换
+    VkPipeline pipe = g.pipe128_h[dtype][variant];
+    if (getenv("VKBLAS_V9H") != NULL && g.pipe128v9h[dtype][variant] != VK_NULL_HANDLE)
+        pipe = g.pipe128v9h[dtype][variant];
+    if (pipe == VK_NULL_HANDLE) return -1;
     VkDescriptorBufferInfo db[3] = {
         {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
     VkWriteDescriptorSet wds[3];
@@ -1105,7 +1126,7 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
         (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
 
     if (submit) cmd_begin();
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128_h[dtype][variant]);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
