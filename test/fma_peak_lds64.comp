@@ -1,0 +1,48 @@
+#version 450
+// fma_peak_lds64.comp — 64 FMA/轮 + DSN 条 vec2 LDS 读 (v9 主循环的 fma_peak 对照)
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out_buf { uint O[]; };
+shared vec2 L[1024];
+layout(push_constant) uniform Params { uint rounds; uint pad; } p;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65536u;
+    uint lt = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 64u;  // 0..255
+    float x = float(tid & 0xFF) * 1e-6 + 1.0f;
+    for (int i = 0; i < 4; i++) L[lt + i * 256u] = vec2(x + float(i), x * 0.5f + float(i));
+    barrier();
+    float b[64];
+    for (int i = 0; i < 64; i++) b[i] = x + float(i) * 1e-7f;
+    for (uint r = 0; r < p.rounds; r++) {
+        // v8 无冲突地址模式: (lt%16)*2 + (lt/16)*32 → wave 内 16 地址 × 2 bank 全唯一
+        uint a0 = (lt & 15u) * 2u + (lt >> 4) * 32u;
+#if DSN >= 2
+        vec2 d0 = L[a0 % 1024u];
+        b[0] = fma(b[0], d0.x, d0.y);
+#endif
+#if DSN >= 4
+        vec2 d1 = L[(a0 + 64u) % 1024u];
+        b[1] = fma(b[1], d1.x, d1.y);
+#endif
+#if DSN >= 6
+        vec2 d2 = L[(a0 + 128u) % 1024u];
+        b[2] = fma(b[2], d2.x, d2.y);
+#endif
+#if DSN >= 8
+        vec2 d3 = L[(a0 + 192u) % 1024u];
+        b[3] = fma(b[3], d3.x, d3.y);
+        vec2 d4 = L[(a0 + 256u) % 1024u];
+        b[4] = fma(b[4], d4.x, d4.y);
+        vec2 d5 = L[(a0 + 320u) % 1024u];
+        b[5] = fma(b[5], d5.x, d5.y);
+        vec2 d6 = L[(a0 + 384u) % 1024u];
+        b[6] = fma(b[6], d6.x, d6.y);
+        vec2 d7 = L[(a0 + 448u) % 1024u];
+        b[7] = fma(b[7], d7.x, d7.y);
+#endif
+        for (int i = 0; i < 64; i++) b[i] = fma(b[i], x, b[(i + 17) % 64]);
+    }
+    float s = 0.0f;
+    for (int i = 0; i < 64; i++) s += b[i];
+    O[gl_GlobalInvocationID.x] = floatBitsToUint(s);
+}

@@ -6,7 +6,7 @@
 
 #define CHECK(x) do { VkResult r = (x); if (r != VK_SUCCESS) { fprintf(stderr, "%s failed: %d\n", #x, r); return 1; } } while (0)
 
-int main(void) {
+int main(int argc, char** argv) {
     VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_0 };
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai };
     VkInstance inst; CHECK(vkCreateInstance(&ici, NULL, &inst));
@@ -32,8 +32,9 @@ int main(void) {
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &plci, NULL, &pl));
 
-    // 读 spv
-    FILE* f = fopen("test/fma_peak.spv", "rb");
+    // 读 spv (argv[1] 可选, 默认 test/fma_peak.spv)
+    const char* spv_path = argc > 1 ? argv[1] : "test/fma_peak.spv";
+    FILE* f = fopen(spv_path, "rb");
     if (!f) { fprintf(stderr, "open spv\n"); return 1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     uint32_t* code = malloc(sz); fread(code, 1, sz, f); fclose(f);
@@ -68,6 +69,7 @@ int main(void) {
     // wg 数: 满 36 CU × 若干 wave; 每 wg 8 wave (64×4)
     uint32_t wgs[] = { 144, 288, 576, 1152, 2304 };
     uint32_t rounds = 100000;
+    uint32_t fmac_per_round = argc > 2 ? (uint32_t)atoi(argv[2]) : 96;
     for (int wi = 0; wi < 5; wi++) {
         uint32_t nwg = wgs[wi];
         struct { uint32_t rounds, nwg; } pc = { rounds, nwg };
@@ -92,7 +94,7 @@ int main(void) {
             double dt = ts.tv_sec + ts.tv_nsec / 1e9 - t0;
             if (dt < best) best = dt;
         }
-        double flop = (double)nwg * 256 * 96 * 2 * rounds;
+        double flop = (double)nwg * 256 * fmac_per_round * 2 * rounds;
         printf("wg=%6d  %8.4f ms  %.2f TFLOPS\n", nwg, best * 1e3, flop / best / 1e12);
     }
     return 0;
