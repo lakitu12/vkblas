@@ -1,0 +1,20 @@
+#version 450
+// 纯 FMA 峰值测试 v2: 96 独立寄存器, 每轮 96 fma (交叉引用防折叠)
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out_buf { uint O[]; };
+layout(push_constant) uniform Params { uint rounds; uint pad; } p;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65536u;
+    float b[96];
+    float x = float(tid & 0xFF) * 1e-6 + 1.0f;
+    for (int i = 0; i < 96; i++) b[i] = x + float(i) * 1e-7f;
+    // 每轮 96 条独立 fma: b[i] = fma(b[i], x, b[(i+17)%96])
+    // 只用旧值 → 每轮内 96 路 ILP; 交叉引用 (i+17) → 代数不可折叠
+    for (uint r = 0; r < p.rounds; r++) {
+        for (int i = 0; i < 96; i++) b[i] = fma(b[i], x, b[(i + 17) % 96]);
+    }
+    float s = 0.0f;
+    for (int i = 0; i < 96; i++) s += b[i];
+    O[gl_GlobalInvocationID.x] = floatBitsToUint(s);
+}

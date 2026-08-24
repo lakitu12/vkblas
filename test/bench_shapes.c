@@ -116,8 +116,8 @@ int main(void) {
         hipMemcpy(dA, hA, sa * 4, hipMemcpyHostToDevice);
         hipMemcpy(dB, hB, sb * 4, hipMemcpyHostToDevice);
 
-        // ---- v6 (env unset) ----
-        unsetenv("VKBLAS_TILE128");
+        // ---- v6 (强制 64×64 tile; unsetenv 会落回 pick_tile128 默认 → v7, 对照失真) ----
+        setenv("VKBLAS_TILE128", "0", 1);
         call_nn(vk, h, M, N, K, dA, dB, dC); hipDeviceSynchronize();
         hipMemcpy(hC, dC, sc * 4, hipMemcpyDeviceToHost);
         float* hC6 = malloc(sc * 4); memcpy(hC6, hC, sc * 4);
@@ -149,7 +149,7 @@ int main(void) {
 
         // ---- 计时 (重新跑, 数据已在 device) ----
         double best6 = 1e9, best7 = 1e9;
-        unsetenv("VKBLAS_TILE128");
+        setenv("VKBLAS_TILE128", "0", 1);
         for (int it = 0; it < 3; it++) {
             double t0 = now_s();
             call_nn(vk, h, M, N, K, dA, dB, dC); hipDeviceSynchronize();

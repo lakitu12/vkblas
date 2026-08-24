@@ -1,0 +1,183 @@
+#version 450
+// GEMM f32 v8: tile 128×64 (M×N), BK=16, 256 线程 (16×16), 每线程 8×4 = 32 累加器
+// 设计目标: 修复 v7-128 两个瓶颈 (2026-08-24 ISA 分析):
+//   1. v7 每线程 64 acc → 98 VGPR → 每 CU 仅 2 wg (每 SIMD 2 wave) → FMA 峰值 50%
+//      v8: 32 acc → ~60 VGPR → 4 wg/CU (每 SIMD 4 wave) → FMA 100%
+//   2. v7 LDS 读 As[kk][lx*8+i] 4-way bank 冲突 (步长 32B ≡ bank 周期 32B)
+//      v8: 读 As[kk][lx + i*16] (i 0..7, 单 b32 交错) → lx 0-15 bank 全唯一, 无冲突
+// 算术密度: 128×64×16 = 262144 FLOP / 12KB = 21.8 FLOP/B (v6: 16, v7: 32 但被占用率拖死)
+// 全局流量 4096³: A 4GB (Nt=64) + B 2GB (Mt=32) = 6GB, B 同 tgy 共享 L2 → ~20ms 带宽侧
+// LDS: As[16][130] (k×m) + Bs[16][66] (k×n) = 12.3KB → 4-5 wg/CU (LDS 不卡)
+// 编译期宏 TA/TB
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { float A[]; };
+layout(set = 0, binding = 1) buffer B_buf { float B[]; };
+layout(set = 0, binding = 2) buffer C_buf { float C[]; };
+
+layout(push_constant) uniform Params {
+    uint M, N, K;
+    uint Mt, Nt, Kt;
+    uint lda, ldb, ldc;
+    uint batch_stride_a, batch_stride_b, batch_stride_c;
+    float alpha, beta;
+} p;
+
+// As[k][m]: k 16 行 × m 128 列, 行步长 130 (128+2, b64 对齐)
+// Bs[k][n]: k 16 行 × n 64 列, 行步长 66 (64+2, b64 对齐)
+shared float As[16][130];
+shared float Bs[16][66];
+
+void load_tile(uint kt) {
+    uint base_k = kt * 16;
+    uint b = gl_WorkGroupID.x / p.Mt;                 // batch 索引
+    uint tgx = gl_WorkGroupID.x % p.Mt;
+    uint base_m = tgx * 128;
+    uint base_n = gl_WorkGroupID.y * 64;
+    uint tid = gl_LocalInvocationID.y * 16 + gl_LocalInvocationID.x;
+    uint aoff = b * p.batch_stride_a;
+    uint boff = b * p.batch_stride_b;
+
+    // A: 128×16 tile = 2048 元素, tid<128 加载 (128 线程 × 16)
+    if (tid < 128) {
+        uint m0 = (tid % 32) * 4;
+        uint k0 = (tid / 32) * 4;
+        uint am = base_m + m0;
+        uint ak = base_k + k0;
+#if TA == 1
+        // A 是 (K×M): A_eff[m][k] = A[k*lda+m], m 连续 4 → vec4, As[k][m] 直接存
+        for (int r = 0; r < 4; r++) {
+            uint kk = ak + r;
+            if (kk < p.K && am + 3 < p.M) {
+                vec4 v = vec4(A[aoff + kk * p.lda + am], A[aoff + kk * p.lda + am + 1],
+                              A[aoff + kk * p.lda + am + 2], A[aoff + kk * p.lda + am + 3]);
+                As[k0 + r][m0 + 0] = v.x; As[k0 + r][m0 + 1] = v.y;
+                As[k0 + r][m0 + 2] = v.z; As[k0 + r][m0 + 3] = v.w;
+            } else {
+                for (int c = 0; c < 4; c++) {
+                    uint mm = am + uint(c);
+                    As[k0 + r][m0 + c] = (kk < p.K && mm < p.M) ? A[aoff + kk * p.lda + mm] : 0.0;
+                }
+            }
+        }
+#else
+        // A 是 (M×K): A_eff[m][k] = A[m*lda+k], k 连续 4 → vec4, As[k][m] 转置存
+        for (int r = 0; r < 4; r++) {
+            uint mm = am + r;
+            if (mm < p.M && ak + 3 < p.K) {
+                vec4 v = vec4(A[aoff + mm * p.lda + ak], A[aoff + mm * p.lda + ak + 1],
+                              A[aoff + mm * p.lda + ak + 2], A[aoff + mm * p.lda + ak + 3]);
+                As[k0 + 0][m0 + r] = v.x; As[k0 + 1][m0 + r] = v.y;
+                As[k0 + 2][m0 + r] = v.z; As[k0 + 3][m0 + r] = v.w;
+            } else {
+                for (int c = 0; c < 4; c++) {
+                    uint kk = ak + uint(c);
+                    As[k0 + c][m0 + r] = (mm < p.M && kk < p.K) ? A[aoff + mm * p.lda + kk] : 0.0;
+                }
+            }
+        }
+#endif
+    } else {
+        // B: 16×64 tile (K×N) = 1024 元素, tid>=128 加载 (128 线程 × 8)
+        // 每线程 4 n × 2 k
+        uint t2 = tid - 128;
+        uint n0 = (t2 % 16) * 4;
+        uint k0 = (t2 / 16) * 2;
+        uint bn = base_n + n0;
+        uint bk = base_k + k0;
+#if TB == 1
+        // B 是 (N×K): B_eff[k][n] = B[n*ldb+k], k 连续 2 → vec2, Bs[k][n] 转置存
+        for (int r = 0; r < 4; r++) {
+            uint nn = bn + r;
+            if (nn < p.N && bk + 1 < p.K) {
+                vec2 v = vec2(B[boff + nn * p.ldb + bk], B[boff + nn * p.ldb + bk + 1]);
+                Bs[k0 + 0][n0 + r] = v.x; Bs[k0 + 1][n0 + r] = v.y;
+            } else {
+                for (int c = 0; c < 2; c++) {
+                    uint kk = bk + uint(c);
+                    Bs[k0 + c][n0 + r] = (nn < p.N && kk < p.K) ? B[boff + nn * p.ldb + kk] : 0.0;
+                }
+            }
+        }
+#else
+        // B 是 (K×N): B_eff[k][n] = B[k*ldb+n], n 连续 4 → vec4, Bs[k][n] 直接存
+        for (int r = 0; r < 2; r++) {
+            uint kk = bk + r;
+            if (kk < p.K && bn + 3 < p.N) {
+                vec4 v = vec4(B[boff + kk * p.ldb + bn], B[boff + kk * p.ldb + bn + 1],
+                              B[boff + kk * p.ldb + bn + 2], B[boff + kk * p.ldb + bn + 3]);
+                Bs[k0 + r][n0 + 0] = v.x; Bs[k0 + r][n0 + 1] = v.y;
+                Bs[k0 + r][n0 + 2] = v.z; Bs[k0 + r][n0 + 3] = v.w;
+            } else {
+                for (int c = 0; c < 4; c++) {
+                    uint nn = bn + uint(c);
+                    Bs[k0 + r][n0 + c] = (kk < p.K && nn < p.N) ? B[boff + kk * p.ldb + nn] : 0.0;
+                }
+            }
+        }
+#endif
+    }
+}
+
+void main() {
+    uint tgx = gl_WorkGroupID.x % p.Mt;              // tile m (batch 已并入 x 轴)
+    uint b = gl_WorkGroupID.x / p.Mt;
+    uint tgy = gl_WorkGroupID.y;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint base_m = tgx * 128, base_n = tgy * 64;
+
+    // acc[i][j]: i = m 组 (8), j = n 组 (4)
+    float acc[8][4];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = 0.0;
+
+    load_tile(0);
+    barrier();
+
+    for (uint kt = 0; kt < p.Kt; kt++) {
+#pragma unroll 1
+        for (int kk = 0; kk < 16; kk++) {
+            // 无 bank 冲突读 (v2): 显式 vec2 (b64) 基步长 2 flt — 16 线程基地址
+            //   lx*2 % 32 = {0,2,...30} 全唯一, 每条 b64 占 2 banks 不重叠:
+            //   A: 4×vec2 基 lx*2 + ii*32 → 128 列全覆盖; 相邻 base 差 32 flt → 无法合并 vec4
+            //   B: 2×vec2 基 ly*2 + j*32 → 64 列全覆盖
+            // acc[i][j]: i = 2*ii+c (A 行), j = 2*jj+d (B 列)
+            float arow[8], brow[4];
+            for (int ii = 0; ii < 4; ii++) {
+                vec2 a = vec2(As[kk][lx * 2 + ii * 32], As[kk][lx * 2 + ii * 32 + 1]);
+                arow[ii * 2 + 0] = a.x; arow[ii * 2 + 1] = a.y;
+            }
+            for (int jj = 0; jj < 2; jj++) {
+                vec2 b = vec2(Bs[kk][ly * 2 + jj * 32], Bs[kk][ly * 2 + jj * 32 + 1]);
+                brow[jj * 2 + 0] = b.x; brow[jj * 2 + 1] = b.y;
+            }
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] += arow[i] * brow[j];
+        }
+        barrier();
+        if (kt + 1 < p.Kt) {
+            load_tile(kt + 1);
+            barrier();
+        }
+    }
+
+    // 写 C: 每线程 8 行 (m = lx*2 + ii*32 + c) × 4 列 (n = ly*2 + jj*32 + d)
+    uint coff = b * p.batch_stride_c;
+    for (int ii = 0; ii < 4; ii++) {
+        for (int c = 0; c < 2; c++) {
+            uint row = base_m + lx * 2 + ii * 32 + c;
+            if (row >= p.M) continue;
+            for (int jj = 0; jj < 2; jj++) {
+                for (int d = 0; d < 2; d++) {
+                    uint col = base_n + ly * 2 + jj * 32 + d;
+                    if (col < p.N) {
+                        float cval = (p.beta != 0.0) ? C[coff + row * p.ldc + col] : 0.0;
+                        C[coff + row * p.ldc + col] = p.alpha * acc[ii * 2 + c][jj * 2 + d] + p.beta * cval;
+                    }
+                }
+            }
+        }
+    }
+}

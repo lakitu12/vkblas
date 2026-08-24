@@ -42,10 +42,13 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     VkPipeline rhpipe[2];  // split_k_reduce_h: [0]=fp16, [1]=bf16
     VkPipeline rhpipe_m[2];  // split_k_reduce_m: [0]=fp16, [1]=bf16
     VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 64 acc/线程
+    VkPipeline pipe128x64[4]; // v8: 128×64 tile, BK16, 32 acc/线程 (VKBLAS_V8=1 启用, 修 VGPR 占用+LDS 冲突)
+    VkPipeline pipe128v9[4]; // v9: 128×128 + v8 无冲突读 (64 acc; VKBLAS_V9=1 启用)
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
     // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
     VkPipeline pipe_h[2][4];
     VkPipeline pipe128_h[2][4];
+    VkPipeline pipe128x64_h[2][4]; // v8h: 128×64 2B 直通 (32 acc, 60 VGPR; VKBLAS_V8=1 启用)
     VkPipeline tpipe_h[2];
     // split-k (llama.cpp 借鉴: K 分段并行 + reduce 归约); 仅 fp32
     VkPipeline pipe_sk[4];        // v6 tile split-k 4 变体
@@ -280,6 +283,30 @@ static void init_vkblas(void) {
         vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cp128, NULL, &g.pipe128[i]), "pipeline128");
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
+    // v8 128×64 tile (实验性, 缺 shader 则不可用; VKBLAS_V8=1 时 fp32 GEMM 走此路径)
+    static const char* names128x64[4] = { "gemm128x64_nn.spv", "gemm128x64_nt.spv", "gemm128x64_tn.spv", "gemm128x64_tt.spv" };
+    for (int i = 0; i < 4; i++) {
+        g.pipe128x64[i] = VK_NULL_HANDLE;
+        if (load_spv(names128x64[i], &sm) != 0) continue;
+        VkComputePipelineCreateInfo cp8 = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+            .layout = g.pl };
+        vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cp8, NULL, &g.pipe128x64[i]), "pipeline128x64");
+        vkDestroyShaderModule(g.dev, sm, NULL);
+    }
+    // v9 128×128 tile (64 acc + 无冲突 LDS 读; VKBLAS_V9=1 时 fp32 GEMM 走此路径)
+    static const char* names128v9[4] = { "gemm128v9_nn.spv", "gemm128v9_nt.spv", "gemm128v9_tn.spv", "gemm128v9_tt.spv" };
+    for (int i = 0; i < 4; i++) {
+        g.pipe128v9[i] = VK_NULL_HANDLE;
+        if (load_spv(names128v9[i], &sm) != 0) continue;
+        VkComputePipelineCreateInfo cp9 = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+            .layout = g.pl };
+        vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cp9, NULL, &g.pipe128v9[i]), "pipeline128v9");
+        vkDestroyShaderModule(g.dev, sm, NULL);
+    }
 
     VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 72 };  // GEMM 3+转置 2+cvt 8×2+实例 8×2+cx 2×3+cmb 4+cz 3+cm64 4
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -346,11 +373,15 @@ static void init_vkblas(void) {
     static const char* h128names[2][4] = {
         { "gemm128_h16_nn.spv", "gemm128_h16_nt.spv", "gemm128_h16_tn.spv", "gemm128_h16_tt.spv" },
         { "gemm128_b16_nn.spv", "gemm128_b16_nt.spv", "gemm128_b16_tn.spv", "gemm128_b16_tt.spv" } };
+    static const char* h128x64names[2][4] = {
+        { "gemm128x64_h16_nn.spv", "gemm128x64_h16_nt.spv", "gemm128x64_h16_tn.spv", "gemm128x64_h16_tt.spv" },
+        { "gemm128x64_b16_nn.spv", "gemm128x64_b16_nt.spv", "gemm128x64_b16_tn.spv", "gemm128x64_b16_tt.spv" } };
     static const char* htnames[2] = { "transpose_h16.spv", "transpose_b16.spv" };
     for (int d = 0; d < 2; d++) {
         for (int i = 0; i < 4; i++) {
             g.pipe_h[d][i] = VK_NULL_HANDLE;
             g.pipe128_h[d][i] = VK_NULL_HANDLE;
+            g.pipe128x64_h[d][i] = VK_NULL_HANDLE;
             if (load_spv(hnames[d][i], &sm) == 0) {
                 VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                     .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
@@ -365,6 +396,14 @@ static void init_vkblas(void) {
                                VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
                     .layout = g.pl };
                 vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128_h[d][i]), "h128 pipe");
+                vkDestroyShaderModule(g.dev, sm, NULL);
+            }
+            if (load_spv(h128x64names[d][i], &sm) == 0) {
+                VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                               VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                    .layout = g.pl };
+                vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128x64_h[d][i]), "h128x64 pipe");
                 vkDestroyShaderModule(g.dev, sm, NULL);
             }
         }
@@ -758,11 +797,10 @@ static void release_ptr(VkDeviceMemory mem, VkBuffer buf) {
 
 // v7-128 tile 适用性 (所有 GEMM 路径统一入口):
 //   128×128 tile 在 M,N≥256 时快 5-76%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度;
-//   NN 实测定界 (gfx803, 2026-08-23):
-//     方阵/近方阵: v7 多数胜 (1.05-1.07x), 大方阵 v6 略快 (0.97-0.99x)
-//     M<N (高瘦): v7 胜或持平 (0.90-1.07x), batch 大时 (bs512) v6 更优 (0.90x)
-//     M>N 窄 N (Nt≤4) + Mt≤32 + tiles≥128: v6 胜 (0.81x) — 仅 (4096,512) 边界
-//     其余 M>N 窄 N: v7 大胜 (1.13-3.29x)
+//   实验性 v8 (128×64, 32 acc) / v9 (128×128 无冲突读) 与 v7 持平 (gfx803 LDS 中转 ~50% 效率墙)
+// NN 实测定界 (gfx803, 2026-08-24, VKBLAS_TILE128=0 强制真 v6 对照):
+//     方阵/近方阵: v7 全面胜 (4096³: v6 73ms / v7 52ms; M<256 走 v6 保持并行度)
+//     M>N 窄 N: v7 在 (4096,512) 大胜 (1.6x); 中 shape (1024-2048) v6 微胜 ≤8% (维持 v7 简化)
 //   环境变量 VKBLAS_TILE128=0/1 强制覆盖 (调试/对比)
 static int pick_tile128(uint32_t M, uint32_t N) {
     const char* env = getenv("VKBLAS_TILE128");
@@ -772,8 +810,6 @@ static int pick_tile128(uint32_t M, uint32_t N) {
     }
     if (M < 256 || N < 256) return 0;
     uint32_t Mt = (M + 127) / 128, Nt = (N + 127) / 128;
-    // M>N 窄 N: v7 workgroup 数少 → 占用率不足; 仅在 (4096,512) 边界 v6 胜
-    if (M > N && Nt <= 4 && Mt * Nt >= 128 && Mt <= 32) return 0;
     return 1;
 }
 
@@ -1064,6 +1100,38 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
     return 0;
 }
 
+// 直通 GEMM 提交 (v8h 128×64 tile, 2B 元素; VKBLAS_V8=1 启用)
+static int run_gemm_h128x64(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                            VkBuffer bC, size_t bc,
+                            uint32_t M, uint32_t N, uint32_t K,
+                            uint32_t lda, uint32_t ldb, uint32_t ldc,
+                            uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                            float alpha, float beta, int submit) {
+    if (g.pipe128x64_h[dtype][variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 63) / 64, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
+
+    if (submit) cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128x64_h[dtype][variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
+    if (submit) cmd_end_submit("half GEMM128x64 submit");
+    return 0;
+}
+
 // Forward declarations: the fused helper is kept next to the half path, while
 // the fp32 record-only submitters are defined below.
 static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
@@ -1096,7 +1164,11 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
     size_t bb_t = (size_t)batch * N * ldb_t * 2;
     cmd_barrier(bBt, bb_t);
     int rc;
-    if (use128)
+    if (use128 == 2)
+        rc = run_gemm_h128x64(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
+                              M, N, K, lda, ldb_t, ldc, batch, stride_a,
+                              (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+    else if (use128)
         rc = run_gemm_h128(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
                            M, N, K, lda, ldb_t, ldc, batch, stride_a,
                            (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
@@ -1174,12 +1246,17 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_
         release_ptr(mA, bA); release_ptr(mB, bB); return VKBLAS_ERR_FALLBACK;
     }
     int rc = 0;
+    int use_v8 = getenv("VKBLAS_V8") != NULL && g.pipe128x64_h[0][0] != VK_NULL_HANDLE;
     if (op_b == VKBLAS_OP_N) {
         int use128 = pick_tile128(M, N);
-        rc = run_fused_half_transpose_gemm(dtype, use128, variant,
+        rc = run_fused_half_transpose_gemm(dtype, use_v8 ? 2 : use128, variant,
                                            bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
                                            M, N, K, lda, ldb, ldc, batch,
                                            stride_a, stride_b, stride_c, alpha, beta);
+    } else if (use_v8) {
+        rc = run_gemm_h128x64(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
+                              M, N, K, lda, ldb, ldc,
+                              batch, stride_a, stride_b, stride_c, alpha, beta, 1);
     } else if (pick_tile128(M, N)) {
         rc = run_gemm_h128(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
                            M, N, K, lda, ldb, ldc,
@@ -1282,10 +1359,15 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
         }
         if (op_b == VKBLAS_OP_N) {
             int use128 = pick_tile128(M, N);
-            rc = run_fused_half_transpose_gemm(dtype, use128, variant,
+            int use_v8 = getenv("VKBLAS_V8") != NULL && g.pipe128x64_h[0][0] != VK_NULL_HANDLE;
+            rc = run_fused_half_transpose_gemm(dtype, use_v8 ? 2 : use128, variant,
                                                bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
                                                M, N, K, lda, ldb, ldc, 1,
                                                0, 0, 0, alpha, beta);
+        } else if (getenv("VKBLAS_V8") != NULL && g.pipe128x64_h[0][0] != VK_NULL_HANDLE) {
+            rc = run_gemm_h128x64(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                  M, N, K, lda, ldb, ldc, 1,
+                                  0, 0, 0, alpha, beta, 1);
         } else if (pick_tile128(M, N)) {
             // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
             int okt = 0;
@@ -1386,6 +1468,70 @@ static int run_gemm_vk128(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size
     vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     if (submit) cmd_end_submit("GEMM128 submit");
+    return 0;
+}
+
+// v8 128×64 tile GEMM 提交 (128×64, BK16, 32 acc/线程; VKBLAS_V8=1 启用)
+static int run_gemm_vk128x64(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                             VkBuffer bC, size_t bc,
+                             uint32_t M, uint32_t N, uint32_t K,
+                             uint32_t lda, uint32_t ldb, uint32_t ldc,
+                             uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                             float alpha, float beta, int submit) {
+    if (g.pipe128x64[variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 63) / 64, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
+
+    if (submit) cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128x64[variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
+    if (submit) cmd_end_submit("GEMM128x64 submit");
+    return 0;
+}
+
+// v9 128×128 tile GEMM 提交 (64 acc + v8 无冲突 LDS 读; VKBLAS_V9=1 启用)
+static int run_gemm_vk128v9(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                            VkBuffer bC, size_t bc,
+                            uint32_t M, uint32_t N, uint32_t K,
+                            uint32_t lda, uint32_t ldb, uint32_t ldc,
+                            uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                            float alpha, float beta, int submit) {
+    if (g.pipe128v9[variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
+
+    if (submit) cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128v9[variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
+    if (submit) cmd_end_submit("GEMM128v9 submit");
     return 0;
 }
 
@@ -2254,6 +2400,10 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
     // VKBLAS_TILE128=1: fp32 GEMM 走 v7-128 tile (llama l_warptile 移植, 实验对比)
     // 128×128 tile 在 M,N≥256 时快 5-36%; 小 shape (单/少 wg) 用 v6 (64×64) 保持并行度
     int use128 = pick_tile128(M, N);
+    // VKBLAS_V8=1: 实验性 v8 (128×64 tile, 32 acc/线程) — 修 v7 的 VGPR 占用率 + LDS bank 冲突
+    int use_v8 = getenv("VKBLAS_V8") != NULL && g.pipe128x64[0] != VK_NULL_HANDLE;
+    // VKBLAS_V9=1: 实验性 v9 (128×128 + 无冲突 LDS 读, 64 acc)
+    int use_v9 = getenv("VKBLAS_V9") != NULL && g.pipe128v9[0] != VK_NULL_HANDLE;
 
     // split-k (llama.cpp 借鉴): K>=2048 时补足 wave 占用; gfx803=36 CU:
     // tiles<=18: split_count=min(36/tiles,8); tiles 19..24: split_count=3;
@@ -2261,7 +2411,7 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
     int rc = -1;
     uint32_t Mt = use128 ? (M + 127) / 128 : (M + 63) / 64;
     uint32_t Nt = use128 ? (N + 127) / 128 : (N + 63) / 64;
-    if (batch == 1 && K >= 2048 && Mt * Nt <= 24 &&
+    if (!use_v8 && batch == 1 && K >= 2048 && Mt * Nt <= 24 &&
         (use128 ? g.pipe_sk128[0] : g.pipe_sk[0]) != VK_NULL_HANDLE &&
         getenv("VKBLAS_NOSPLITK") == NULL) {
         uint32_t tiles = Mt * Nt;
@@ -2274,7 +2424,13 @@ static int run_gemm(int variant, const void* A, VkBuffer bB_opt, const void* B, 
         }
     }
     if (rc != 0) {
-        if (use128)
+        if (use_v9)
+            rc = run_gemm_vk128v9(variant, bA, ba_all, bB, bb_all, bC, bc_all,
+                                  M, N, K, lda, ldb, ldc, batch, stride_a, stride_b, stride_c, alpha, beta, 1);
+        else if (use_v8)
+            rc = run_gemm_vk128x64(variant, bA, ba_all, bB, bb_all, bC, bc_all,
+                                   M, N, K, lda, ldb, ldc, batch, stride_a, stride_b, stride_c, alpha, beta, 1);
+        else if (use128)
             rc = run_gemm_vk128(variant, bA, ba_all, bB, bb_all, bC, bc_all,
                                 M, N, K, lda, ldb, ldc, batch, stride_a, stride_b, stride_c, alpha, beta, 1);
         else
