@@ -7,3 +7,5 @@ test/test_cache
 # scratch / backups
 *.bak-*
 *.orig
+test/fma_peak
+test/isa_dump

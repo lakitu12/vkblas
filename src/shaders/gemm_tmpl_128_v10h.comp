@@ -1,0 +1,246 @@
+#version 450
+// GEMM 2B 真直通 v10h (实验性, VKBLAS_V10H=1 启用; 结论: 输给 v7h 假直通!)
+// tile 128×128 (M×N), BK=16, 256 线程 (16×16), 每线程 8×8 = 64 acc
+// LDS 存打包 uint (每 uint 2 个 2B 值), 主循环解包后 FMA:
+//   - LDS 流量减半 (2KB/kk vs 4KB/kk), ds 条数减半
+//   - 实测 (gfx803, 4096³): bf16 2.03-2.15T / fp16 2.21T, v7h 假直通 2.88T
+//   与 fma_peak E0a 结论一致: gfx803 ds 成本与字节/宽度无关 (固定 ~5 拍 + 延迟),
+//   2B 直通省掉的流量不兑现, 反而多付解包指令 (bf16 16 条, fp16 8 条/kk)
+// 布局: 行 = 128 值 2B = 16 uvec4 (272B, 16B 对齐), 打包方向 m/n
+// 主循环: 每 kk 1 uvec4/边 (b128, ACO 折 2×b64 有 2-way 冲突)
+// 保留原因: VKBLAS_V10H=1 对照, 验证"2B 直通"假设的完整证据链
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer A_buf { uint A[]; };
+layout(set = 0, binding = 1) buffer B_buf { uint B[]; };
+layout(set = 0, binding = 2) buffer C_buf { uint C[]; };
+
+layout(push_constant) uniform Params {
+    uint M, N, K;
+    uint Mt, Nt, Kt;
+    uint lda, ldb, ldc;
+    uint batch_stride_a, batch_stride_b, batch_stride_c;
+    float alpha, beta;
+} p;
+
+shared uvec4 As[16][17];
+shared uvec4 Bs[16][17];
+
+// ---- 2B 解包/打包 ----
+float hx(uint u, uint hb) {
+#if HALF_TYPE == 1
+    return unpackHalf2x16(u)[hb];
+#else
+    return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u);
+#endif
+}
+uint f2h(float v) {
+#if HALF_TYPE == 1
+    return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu;
+#else
+    uint u = floatBitsToUint(v);
+    return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0xFFFFu;   // RNE
+#endif
+}
+// 2B 全局读: e = 元素索引, 返回打包 2 值 (e, e+1)
+uint gload2(uint e, int b) {
+    if ((e & 1u) == 0u) return (b == 0 ? A[e >> 1] : B[e >> 1]);
+    uint u0 = (b == 0 ? A[e >> 1] : B[e >> 1]);
+    uint u1 = (b == 0 ? A[(e >> 1) + 1u] : B[(e >> 1) + 1u]);
+#if HALF_TYPE == 1
+    return packHalf2x16(vec2(hx(u0, 1u), hx(u1, 0u)));
+#else
+    return ((u0 >> 16) & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
+#endif
+}
+// 读改写 LDS half (uvec4 数组; 行 row, 列值 m, 数组 sel 0=A 1=B)
+void lds_put(int sel, uint row, uint m, uint hh) {
+    uint col4 = m >> 2;
+    uvec4 v;
+    if (sel == 0) v = As[row][col4]; else v = Bs[row][col4];
+    uint hb = m & 3u;
+    uint comp = hb >> 1;
+    if ((hb & 1u) == 0u) v[comp] = (v[comp] & 0xFFFF0000u) | (hh & 0xFFFFu);
+    else                v[comp] = (v[comp] & 0xFFFFu) | ((hh & 0xFFFFu) << 16);
+    if (sel == 0) As[row][col4] = v; else Bs[row][col4] = v;
+}
+
+void load_tile(uint kt) {
+    uint base_k = kt * 16;
+    uint b = gl_WorkGroupID.x / p.Mt;                 // batch 索引
+    uint tgx = gl_WorkGroupID.x % p.Mt;
+    uint base_m = tgx * 128;
+    uint base_n = gl_WorkGroupID.y * 128;
+    uint tid = gl_LocalInvocationID.y * 16 + gl_LocalInvocationID.x;
+    uint aoff = b * p.batch_stride_a;
+    uint boff = b * p.batch_stride_b;
+
+    // A: 128×16 tile (M×K 语义) = 2048 值; tid<64 加载 (每线程 8 m × 4 k = 32 值)
+    // As[k][m]: k 16 行 × m 128 值 = 每行 16 uvec4 (m 打包, 每 uvec4 = 8 m 值)
+    if (tid < 64) {
+        uint m0 = (tid % 16) * 8;                     // 8 m 值 = 1 uvec4
+        uint k0 = (tid / 16) * 4;                     // 4 k 行
+        uint am = base_m + m0;
+        uint ak = base_k + k0;
+#if TA == 1
+        // A (K×M): A_eff[m][k] = A[k*lda+m]; 全局 m 连续 8 值 = 16B = 1 全局 b128
+        for (int r = 0; r < 4; r++) {
+            uint kk = ak + r;
+            if (kk < p.K && am + 7 < p.M) {
+                uint e = aoff + kk * p.lda + am;
+                As[k0 + r][m0 >> 3] = uvec4(A[e >> 1], A[(e >> 1) + 1u], A[(e >> 1) + 2u], A[(e >> 1) + 3u]);
+            } else {
+                for (int j = 0; j < 8; j++) {
+                    uint mm = am + uint(j);
+                    uint hh = (kk < p.K && mm < p.M) ? gload2(aoff + kk * p.lda + mm, 0) & 0xFFFFu : 0u;
+                    lds_put(0, k0 + r, mm, hh);
+                }
+            }
+        }
+#else
+        // A (M×K): A_eff[m][k] = A[m*lda+k]; 8 m 分散读 → 1 uvec4 整写
+        for (int c = 0; c < 4; c++) {
+            uint kk = ak + uint(c);
+            if (am + 7 < p.M && kk < p.K) {
+                uint h[8];
+                for (int j = 0; j < 8; j++)
+                    h[j] = gload2(aoff + (am + uint(j)) * p.lda + kk, 0) & 0xFFFFu;
+                As[k0 + uint(c)][m0 >> 3] = uvec4(
+                    (h[0] & 0xFFFFu) | ((h[1] & 0xFFFFu) << 16),
+                    (h[2] & 0xFFFFu) | ((h[3] & 0xFFFFu) << 16),
+                    (h[4] & 0xFFFFu) | ((h[5] & 0xFFFFu) << 16),
+                    (h[6] & 0xFFFFu) | ((h[7] & 0xFFFFu) << 16));
+            } else if (kk < p.K) {
+                for (int j = 0; j < 8; j++) {
+                    uint mm = am + uint(j);
+                    uint hh = (mm < p.M) ? gload2(aoff + mm * p.lda + kk, 0) & 0xFFFFu : 0u;
+                    lds_put(0, k0 + uint(c), mm, hh);
+                }
+            } else {
+                for (int j = 0; j < 8; j++) {
+                    lds_put(0, k0 + uint(c), am + uint(j), 0u);
+                }
+            }
+        }
+#endif
+    } else {
+        // B: 16×128 tile (K×N 语义) = 2048 值; tid>=64 加载 (每线程 8 n × 4 k)
+        uint t2l = tid - 64;
+        uint n0 = (t2l % 16) * 8;
+        uint k0 = (t2l / 16) * 4;
+        uint bn = base_n + n0;
+        uint bk = base_k + k0;
+#if TB == 1
+        // B (N×K): B_eff[k][n] = B[n*ldb+k]; 8 n 分散读 → 1 uvec4 整写
+        for (int c = 0; c < 4; c++) {
+            uint kk = bk + uint(c);
+            if (bn + 7 < p.N && kk < p.K) {
+                uint h[8];
+                for (int j = 0; j < 8; j++)
+                    h[j] = gload2(boff + (bn + uint(j)) * p.ldb + kk, 1) & 0xFFFFu;
+                Bs[k0 + uint(c)][n0 >> 3] = uvec4(
+                    (h[0] & 0xFFFFu) | ((h[1] & 0xFFFFu) << 16),
+                    (h[2] & 0xFFFFu) | ((h[3] & 0xFFFFu) << 16),
+                    (h[4] & 0xFFFFu) | ((h[5] & 0xFFFFu) << 16),
+                    (h[6] & 0xFFFFu) | ((h[7] & 0xFFFFu) << 16));
+            } else if (kk < p.K) {
+                for (int j = 0; j < 8; j++) {
+                    uint nn = bn + uint(j);
+                    uint hh = (nn < p.N) ? gload2(boff + nn * p.ldb + kk, 1) & 0xFFFFu : 0u;
+                    lds_put(1, k0 + uint(c), nn, hh);
+                }
+            } else {
+                for (int j = 0; j < 8; j++) {
+                    lds_put(1, k0 + uint(c), bn + uint(j), 0u);
+                }
+            }
+        }
+#else
+        // B (K×N): B_eff[k][n] = B[k*ldb+n]; 全局 n 连续 8 值 = 16B = 1 全局 b128
+        for (int r = 0; r < 4; r++) {
+            uint kk = bk + r;
+            if (kk < p.K && bn + 7 < p.N) {
+                uint e = boff + kk * p.ldb + bn;
+                Bs[k0 + r][n0 >> 3] = uvec4(B[e >> 1], B[(e >> 1) + 1u], B[(e >> 1) + 2u], B[(e >> 1) + 3u]);
+            } else {
+                for (int j = 0; j < 8; j++) {
+                    uint nn = bn + uint(j);
+                    uint hh = (kk < p.K && nn < p.N) ? gload2(boff + kk * p.ldb + nn, 1) & 0xFFFFu : 0u;
+                    lds_put(1, k0 + r, nn, hh);
+                }
+            }
+        }
+#endif
+    }
+}
+
+void main() {
+    uint tgx = gl_WorkGroupID.x % p.Mt;              // tile m (batch 已并入 x 轴)
+    uint b = gl_WorkGroupID.x / p.Mt;
+    uint tgy = gl_WorkGroupID.y;
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint base_m = tgx * 128, base_n = tgy * 128;
+
+    float acc[8][8];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            acc[i][j] = 0.0;
+
+    load_tile(0);
+    barrier();
+
+    for (uint kt = 0; kt < p.Kt; kt++) {
+        for (int kk = 0; kk < 16; kk++) {
+            // 1 uvec4 = 8 值 [lx*8..lx*8+7] (2B); 1 条 b128/边 → 2 ds/kk
+            uvec4 ua = As[kk][lx];
+            uvec4 ub = Bs[kk][ly];
+            float arow[8], brow[8];
+            arow[0] = hx(ua.x, 0); arow[1] = hx(ua.x, 1);
+            arow[2] = hx(ua.y, 0); arow[3] = hx(ua.y, 1);
+            arow[4] = hx(ua.z, 0); arow[5] = hx(ua.z, 1);
+            arow[6] = hx(ua.w, 0); arow[7] = hx(ua.w, 1);
+            brow[0] = hx(ub.x, 0); brow[1] = hx(ub.x, 1);
+            brow[2] = hx(ub.y, 0); brow[3] = hx(ub.y, 1);
+            brow[4] = hx(ub.z, 0); brow[5] = hx(ub.z, 1);
+            brow[6] = hx(ub.w, 0); brow[7] = hx(ub.w, 1);
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 8; j++)
+                    acc[i][j] += arow[i] * brow[j];
+        }
+        barrier();
+        if (kt + 1 < p.Kt) {
+            load_tile(kt + 1);
+            barrier();
+        }
+    }
+
+    // 写 C: 8 行 × 8 列; 行 = lx*8 + ii*2 + c, 列 = ly*8 + jj*2 + d (主循环 arow/brow 布局对应)
+    // 列对 (cc, cc+1) 连续 2B = 1 uint; e 偶 → 整 uint 写; e 奇 → 跨 uint
+    uint coff = b * p.batch_stride_c;
+    for (int ii = 0; ii < 4; ii++) {
+        for (int c = 0; c < 2; c++) {
+            uint row = base_m + lx * 8 + ii * 2 + c;
+            if (row >= p.M) continue;
+            for (int jj = 0; jj < 4; jj++) {
+                uint cc = base_n + ly * 8 + jj * 2;
+                if (cc + 1 >= p.N) continue;
+                uint e = coff + row * p.ldc + cc;
+                float c0 = (p.beta != 0.0)
+                    ? p.alpha * acc[ii * 2 + c][jj * 2 + 0] + p.beta * hx(C[e >> 1], (e & 1u) == 0u ? 0u : 1u)
+                    : p.alpha * acc[ii * 2 + c][jj * 2 + 0];
+                float c1 = (p.beta != 0.0)
+                    ? p.alpha * acc[ii * 2 + c][jj * 2 + 1] + p.beta * hx(C[(e & 1u) == 0u ? (e >> 1) : (e >> 1) + 1u], (e & 1u) == 0u ? 1u : 0u)
+                    : p.alpha * acc[ii * 2 + c][jj * 2 + 1];
+                uint u0 = f2h(c0), u1 = f2h(c1);
+                if ((e & 1u) == 0u) {
+                    C[e >> 1] = (u0 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
+                } else {
+                    uint old = C[e >> 1];
+                    C[e >> 1] = (old & 0xFFFF0000u) | (u0 & 0xFFFFu);
+                    uint old2 = C[(e >> 1) + 1u];
+                    C[(e >> 1) + 1u] = (old2 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
+                }
+            }
+        }
+    }
+}

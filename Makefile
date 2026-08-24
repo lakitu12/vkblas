@@ -21,6 +21,10 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/gemm128x64_h16_nt.spv $(SHADER_DIR)/gemm128x64_h16_tt.spv \
           $(SHADER_DIR)/gemm128v9_nn.spv $(SHADER_DIR)/gemm128v9_tn.spv \
           $(SHADER_DIR)/gemm128v9_nt.spv $(SHADER_DIR)/gemm128v9_tt.spv \
+          $(SHADER_DIR)/gemm128v10h_h16_nn.spv $(SHADER_DIR)/gemm128v10h_h16_tn.spv \
+          $(SHADER_DIR)/gemm128v10h_h16_nt.spv $(SHADER_DIR)/gemm128v10h_h16_tt.spv \
+          $(SHADER_DIR)/gemm128v10h_b16_nn.spv $(SHADER_DIR)/gemm128v10h_b16_tn.spv \
+          $(SHADER_DIR)/gemm128v10h_b16_nt.spv $(SHADER_DIR)/gemm128v10h_b16_tt.spv \
           $(SHADER_DIR)/gemm128x64_b16_nn.spv $(SHADER_DIR)/gemm128x64_b16_tn.spv \
           $(SHADER_DIR)/gemm128x64_b16_nt.spv $(SHADER_DIR)/gemm128x64_b16_tt.spv \
           $(SHADER_DIR)/gemm_h16_nn.spv $(SHADER_DIR)/gemm_h16_tn.spv \
@@ -131,6 +135,23 @@ $(SHADER_DIR)/gemm128x64_b16_nt.spv: $(SHADER_DIR)/gemm128x64_h.comp
 $(SHADER_DIR)/gemm128x64_b16_tn.spv: $(SHADER_DIR)/gemm128x64_h.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
 $(SHADER_DIR)/gemm128x64_b16_tt.spv: $(SHADER_DIR)/gemm128x64_h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
+# --- gemm v10h 128×128 2B LDS 直通 (真打包: HALF_TYPE=1 fp16 / 2 bf16) ---
+$(SHADER_DIR)/gemm128v10h_h16_nn.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v10h_h16_nt.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v10h_h16_tn.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v10h_h16_tt.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v10h_b16_nn.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v10h_b16_nt.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm128v10h_b16_tn.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm128v10h_b16_tt.spv: $(SHADER_DIR)/gemm_tmpl_128_v10h.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
 # --- split-k (llama.cpp 借鉴: K 分段并行 + reduce 归约) ---
 $(SHADER_DIR)/gemm_sk_nn.spv: $(SHADER_DIR)/gemm_sk_tmpl.comp

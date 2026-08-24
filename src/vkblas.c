@@ -44,6 +44,7 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     VkPipeline pipe128[4]; // v7-128 tile (llama l_warptile 移植): 128×128, BK16, 64 acc/线程
     VkPipeline pipe128x64[4]; // v8: 128×64 tile, BK16, 32 acc/线程 (VKBLAS_V8=1 启用, 修 VGPR 占用+LDS 冲突)
     VkPipeline pipe128v9[4]; // v9: 128×128 + v8 无冲突读 (64 acc; VKBLAS_V9=1 启用)
+    VkPipeline pipe128v10h[2][4]; // v10h: 128×128 2B 真打包 LDS 直通 (VKBLAS_V10H=1 启用)
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
     // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
     VkPipeline pipe_h[2][4];
@@ -376,12 +377,16 @@ static void init_vkblas(void) {
     static const char* h128x64names[2][4] = {
         { "gemm128x64_h16_nn.spv", "gemm128x64_h16_nt.spv", "gemm128x64_h16_tn.spv", "gemm128x64_h16_tt.spv" },
         { "gemm128x64_b16_nn.spv", "gemm128x64_b16_nt.spv", "gemm128x64_b16_tn.spv", "gemm128x64_b16_tt.spv" } };
+    static const char* h128v10hnames[2][4] = {
+        { "gemm128v10h_h16_nn.spv", "gemm128v10h_h16_nt.spv", "gemm128v10h_h16_tn.spv", "gemm128v10h_h16_tt.spv" },
+        { "gemm128v10h_b16_nn.spv", "gemm128v10h_b16_nt.spv", "gemm128v10h_b16_tn.spv", "gemm128v10h_b16_tt.spv" } };
     static const char* htnames[2] = { "transpose_h16.spv", "transpose_b16.spv" };
     for (int d = 0; d < 2; d++) {
         for (int i = 0; i < 4; i++) {
             g.pipe_h[d][i] = VK_NULL_HANDLE;
             g.pipe128_h[d][i] = VK_NULL_HANDLE;
             g.pipe128x64_h[d][i] = VK_NULL_HANDLE;
+            g.pipe128v10h[d][i] = VK_NULL_HANDLE;
             if (load_spv(hnames[d][i], &sm) == 0) {
                 VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                     .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
@@ -404,6 +409,14 @@ static void init_vkblas(void) {
                                VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
                     .layout = g.pl };
                 vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128x64_h[d][i]), "h128x64 pipe");
+                vkDestroyShaderModule(g.dev, sm, NULL);
+            }
+            if (load_spv(h128v10hnames[d][i], &sm) == 0) {
+                VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                               VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+                    .layout = g.pl };
+                vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128v10h[d][i]), "h128v10h pipe");
                 vkDestroyShaderModule(g.dev, sm, NULL);
             }
         }
@@ -1132,6 +1145,38 @@ static int run_gemm_h128x64(int dtype, int variant, VkBuffer bA, size_t ba, VkBu
     return 0;
 }
 
+// 直通 GEMM 提交 (v10h 128×128 tile, 2B 真打包 LDS; VKBLAS_V10H=1 启用)
+static int run_gemm_h128v10h(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                             VkBuffer bC, size_t bc,
+                             uint32_t M, uint32_t N, uint32_t K,
+                             uint32_t lda, uint32_t ldb, uint32_t ldc,
+                             uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                             float alpha, float beta, int submit) {
+    if (g.pipe128v10h[dtype][variant] == VK_NULL_HANDLE) return -1;
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 127) / 128, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
+
+    if (submit) cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe128v10h[dtype][variant]);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
+    if (submit) cmd_end_submit("half GEMM128v10h submit");
+    return 0;
+}
+
 // Forward declarations: the fused helper is kept next to the half path, while
 // the fp32 record-only submitters are defined below.
 static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
@@ -1164,7 +1209,11 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
     size_t bb_t = (size_t)batch * N * ldb_t * 2;
     cmd_barrier(bBt, bb_t);
     int rc;
-    if (use128 == 2)
+    if (use128 == 3)
+        rc = run_gemm_h128v10h(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
+                               M, N, K, lda, ldb_t, ldc, batch, stride_a,
+                               (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+    else if (use128 == 2)
         rc = run_gemm_h128x64(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
                               M, N, K, lda, ldb_t, ldc, batch, stride_a,
                               (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
@@ -1360,10 +1409,15 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
         if (op_b == VKBLAS_OP_N) {
             int use128 = pick_tile128(M, N);
             int use_v8 = getenv("VKBLAS_V8") != NULL && g.pipe128x64_h[0][0] != VK_NULL_HANDLE;
-            rc = run_fused_half_transpose_gemm(dtype, use_v8 ? 2 : use128, variant,
+            int use_v10h = getenv("VKBLAS_V10H") != NULL && g.pipe128v10h[dtype][0] != VK_NULL_HANDLE;
+            rc = run_fused_half_transpose_gemm(dtype, use_v10h ? 3 : (use_v8 ? 2 : use128), variant,
                                                bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
                                                M, N, K, lda, ldb, ldc, 1,
                                                0, 0, 0, alpha, beta);
+        } else if (getenv("VKBLAS_V10H") != NULL && g.pipe128v10h[dtype][0] != VK_NULL_HANDLE) {
+            rc = run_gemm_h128v10h(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                   M, N, K, lda, ldb, ldc, 1,
+                                   0, 0, 0, alpha, beta, 1);
         } else if (getenv("VKBLAS_V8") != NULL && g.pipe128x64_h[0][0] != VK_NULL_HANDLE) {
             rc = run_gemm_h128x64(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
                                   M, N, K, lda, ldb, ldc, 1,
