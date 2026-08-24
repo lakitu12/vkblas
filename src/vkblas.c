@@ -1602,7 +1602,9 @@ static int run_matvec_sk_vk(int variant, const void* A, size_t ba,
     (void)oA; (void)oC;
 
     uint32_t Nt = (N + 255) / 256;
-    uint32_t seg = 144 / Nt + 1;
+    uint32_t seg_occ = 144 / Nt + 1;          // 目标 ≥144 wg
+    uint32_t seg_cache = (K + 255) / 256;     // k_split ≤ 256 (缓存效率)
+    uint32_t seg = seg_occ > seg_cache ? seg_occ : seg_cache;
     if (seg < 2) seg = 2;
     if (seg > 64) seg = 64;
     size_t need = (size_t)seg * N * 4;
@@ -1709,7 +1711,9 @@ static int run_matvec_sk_m_vk(int dtype, const void* A, size_t ba, uint32_t lda,
     if (R > M) R = M;
     uint32_t Nt = (N + 511) / 512;
     uint32_t Mg = (M + R - 1) / R;
-    uint32_t seg = 144 / (Nt * Mg) + 1;   // 目标 ~144 wg
+    uint32_t seg_occ = 144 / (Nt * Mg) + 1;   // 目标 ≥144 wg
+    uint32_t seg_cache = (K + 255) / 256;     // k_split ≤ 256 (缓存效率)
+    uint32_t seg = seg_occ > seg_cache ? seg_occ : seg_cache;
     if (seg < 2) seg = 2;                          // K 分段至少 2 (并行度保底)
     if (seg > 64) seg = 64;
     const char* nsk = getenv("VKBLAS_M_SPLITK");
@@ -1921,7 +1925,9 @@ static int run_matvec_sk(int variant, const void* A, size_t ba,
     (void)oA; (void)oB; (void)oC;
 
     uint32_t Nt = (N + 255) / 256;
-    uint32_t seg = 144 / Nt + 1;
+    uint32_t seg_occ = 144 / Nt + 1;          // 目标 ≥144 wg
+    uint32_t seg_cache = (K + 255) / 256;     // k_split ≤ 256 (缓存效率)
+    uint32_t seg = seg_occ > seg_cache ? seg_occ : seg_cache;
     if (seg < 2) seg = 2;
     if (seg > 64) seg = 64;
 
@@ -2030,7 +2036,9 @@ static int run_matvec_sk_h(int dtype, const void* A, size_t ba,
     (void)oA; (void)oB; (void)oC;
 
     uint32_t Nt = (N + 511) / 512;   // half: 每线程 2 列, 256 线程 → 512 列/wg
-    uint32_t seg = 144 / Nt + 1;
+    uint32_t seg_occ = 144 / Nt + 1;          // 目标 ≥144 wg
+    uint32_t seg_cache = (K + 255) / 256;     // k_split ≤ 256 (缓存效率)
+    uint32_t seg = seg_occ > seg_cache ? seg_occ : seg_cache;
     if (seg < 2) seg = 2;
     if (seg > 64) seg = 64;
 
@@ -2127,7 +2135,9 @@ static int run_matvec_sk_h_vk(int dtype, const void* A, size_t ba,
     if (import_ptr(A, ba, &bA, &mA, &oA) != 0) return -1;
     (void)oA;
     uint32_t Nt = (N + 511) / 512;
-    uint32_t seg = 144 / Nt + 1;
+    uint32_t seg_occ = 144 / Nt + 1;          // 目标 ≥144 wg
+    uint32_t seg_cache = (K + 255) / 256;     // k_split ≤ 256 (缓存效率)
+    uint32_t seg = seg_occ > seg_cache ? seg_occ : seg_cache;
     if (seg < 2) seg = 2;
     if (seg > 64) seg = 64;
     size_t need = (size_t)seg * N * 4;
