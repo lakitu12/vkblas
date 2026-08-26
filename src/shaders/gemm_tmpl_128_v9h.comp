@@ -101,16 +101,22 @@ void load_tile(uint kt) {
         }
 #else
         // A 是 (M×K): A_eff[m][k] = A[m*lda+k], k 连续 4
+        // 合并读版: 相邻 4 线程 (kq=tid&3) 同读一行 4 段 (行内 16 half = 32B 一次取满),
+        // 每线程 4 行 × 4 k; 读 L1 行利用率 4× (行分散读 → 段合并读)
+        uint kq = tid & 3u;
+        uint m4 = tid >> 2;
+        uint ak4 = kq * 4;                       // 本线程 k 段 (局部 0..15)
         for (int r = 0; r < 4; r++) {
-            uint mm = am + r;
-            if (mm < p.M && ak + 3 < p.K) {
-                vec4 v = load4(aoff + mm * p.lda + ak, 0);
-                As[k0 + 0][m0 + r] = v.x; As[k0 + 1][m0 + r] = v.y;
-                As[k0 + 2][m0 + r] = v.z; As[k0 + 3][m0 + r] = v.w;
+            uint ml = m4 + uint(r) * 32;         // As 列 (tile 局部 0..127)
+            uint mm = base_m + ml;               // 全局行 (读用)
+            if (mm < p.M && base_k + ak4 + 3 < p.K) {
+                vec4 v = load4(aoff + mm * p.lda + base_k + ak4, 0);
+                As[ak4 + 0][ml] = v.x; As[ak4 + 1][ml] = v.y;
+                As[ak4 + 2][ml] = v.z; As[ak4 + 3][ml] = v.w;
             } else {
                 for (int c = 0; c < 4; c++) {
-                    uint kk = ak + uint(c);
-                    As[k0 + c][m0 + r] = (mm < p.M && kk < p.K) ? load1(aoff + mm * p.lda + kk, 0) : 0.0;
+                    uint kk = base_k + ak4 + uint(c);
+                    As[ak4 + uint(c)][ml] = (mm < p.M && kk < p.K) ? load1(aoff + mm * p.lda + kk, 0) : 0.0;
                 }
             }
         }

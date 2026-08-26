@@ -1261,9 +1261,13 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, int hip_physical, vkblas_
     int rc = 0;
     if (op_b == VKBLAS_OP_N) {
         int use128 = pick_tile128(M, N);
+
         // 免转置直通仅 hipblas 物理布局 (col-major) + bf16: B 内存 = (N×K) 列主序, TB=1 直读合法;
-            // 引擎直连 (hip_physical=0, rm 契约) 永远走转置。f16 直通存在布局结构错, 暂禁 (2026-08-26)
-                int od = hip_physical && dtype == 1 && (lda & 1u) == 0 && (ldb & 1u) == 0 &&
+                // 安全条件 (2026-08-26 补): col-major 物理的列数 = K, TB=1 把 n 当列索引 →
+                //   n ∈ [0,N') 必须落在列数内, 即 N' ≤ K; 对 A' (TA=0) 对称需要 M' ≤ K。
+                //   N'>K 场景直通越界读 (小 shape 曾被 hipMalloc 2MB 池掩盖, 大 shape 直崩)
+                int okm = (M <= K) && (N <= K);
+                int od = hip_physical && dtype == 1 && okm && (lda & 1u) == 0 && (ldb & 1u) == 0 &&
                          (stride_a & 1) == 0 && (stride_b & 1) == 0;
         if (od) {
             if (use128)
@@ -1314,10 +1318,16 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
         bb_e = (size_t)(K - 1) * ldb + N;
         variant = (int)op_a * 2 + 1;                      // 转置后 TB=1
     } else {
-        bb_e = (size_t)(N - 1) * ldb + K;
+        bb_e = (size_t)(N - 1) * ldb + K;   // 覆盖直跑读域 (回退 2026-08-26 实验: 缩小至物理大小致 f16 读超 import 映射)
         variant = (int)op_a * 2 + (int)op_b;
     }
     size_t bc_e = (size_t)(M - 1) * ldc + N;
+
+    // 直通安全条件 (2026-08-26): col-major 物理的列数 = K, TA=1/TB=1 把 m/n 当列索引 →
+    //   m∈[0,M')/n∈[0,N') 必须落在列数内, 即 M'≤K && N'≤K; 不满足时直读越界
+    //   (小 shape 曾被 hipMalloc 2MB 池掩盖, 大 shape 直接 GPU fault), 需转置 B
+    int okm = (M <= K) && (N <= K);
+    int use128 = pick_tile128(M, N);
 
     const char* pa = (const char*)A, *pb = (const char*)B, *pc = (const char*)C;
     int trace = getenv("VKBLAS_TRACE") != NULL;
@@ -1381,8 +1391,10 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
             }
         }
         if (op_b == VKBLAS_OP_N) {
-            int use128 = pick_tile128(M, N);
-            int od = hip_physical && dtype == 1 && (lda & 1u) == 0 && (ldb & 1u) == 0;
+
+            // 免转置直通仅 hipblas 物理布局 (col-major) + bf16, 且 M,N ≤ K (col-major 列数 = K,
+            //   TB=1 把 n 当列索引, n∈[0,N') 必须 ≤ K, 否则越界读 — 2026-08-26 补安全条件)
+            int od = hip_physical && dtype == 1 && okm && (lda & 1u) == 0 && (ldb & 1u) == 0;
             if (od) {
                 if (getenv("VKBLAS_TRACE"))
                     fprintf(stderr, "[vk] %s op_b=N DIRECT (no transpose) variant=%d lda=%u ldb=%u M=%u N=%u K=%u\n",
@@ -1402,6 +1414,9 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
                                                    0, 0, 0, alpha, beta);
             }
         } else if (pick_tile128(M, N)) {
+            // 注: N'/M'>K 时 op_b==T 直跑 TB=1 读 col-major 物理理论上越界, 但实测
+            //   数值正确 (越界读落在 hipMalloc 池内大数据为 0); 转置修复实测 f16 回归
+            //   (130x258x70 NT nbad=255, 根因待查) — 2026-08-26 实验失败回滚, TODO
             // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
             int okt = 0;
             if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
@@ -1417,7 +1432,7 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
                                    M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
             }
         } else {
-            // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
+            // 同 v6 tile 版 (直跑, 同上方注释)
             int okt = 0;
             if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
                 VkBuffer bBt; size_t bt_sz; int tbuilt;
@@ -2588,6 +2603,7 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
     (void)oA; (void)oB; (void)oC;
 
     int rc = 0;
+    int use128 = pick_tile128(M, N);
     cmd_begin();
     int profile = getenv("VKBLAS_PROFILE") != NULL;
     uint64_t pt0 = profile ? now_us() : 0;
@@ -2603,7 +2619,7 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
             if (profile)
                 fprintf(stderr, "[vkblas] prof: transpose rec took %.3fms\n", (now_us() - pt0) / 1e3);
             uint64_t pt1 = profile ? now_us() : 0;
-            int use128 = pick_tile128(M, N);
+
             if (use128)
                 rc = run_gemm_vk128(variant ^ 1, bA, ba_all, bBt, bb_t, bC, bc_all,
                                     M, N, K, lda, ldb_t, ldc, batch, stride_a,
@@ -2639,6 +2655,7 @@ vkblas_status_t vkblas_gemm_f32(
     int64_t stride_a, int64_t stride_b, int64_t stride_c) {
     if (M == 0 || N == 0 || K == 0 || batch == 0) return VKBLAS_ERR_PARAM;
     pthread_mutex_lock(&g.lock);
+    int use128 = pick_tile128(M, N);   // f32 路径 (v6/v7 选用)
     ensure_init();
     if (!g.ready) { pthread_mutex_unlock(&g.lock); return VKBLAS_ERR_INIT; }
 
@@ -2726,7 +2743,7 @@ vkblas_status_t vkblas_gemm_f32(
     }
 
     for (uint32_t i = 0; i < batch; i++) {
-        int use128 = pick_tile128(M, N);
+
         uint32_t fMt = use128 ? (M + 127) / 128 : (M + 63) / 64;
         uint32_t fNt = use128 ? (N + 127) / 128 : (N + 63) / 64;
         int split_candidate = batch == 1 && K >= 2048 && fMt * fNt <= 24 &&
