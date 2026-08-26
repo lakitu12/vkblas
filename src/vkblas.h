@@ -48,6 +48,20 @@ vkblas_status_t vkblas_gemm_bf16(
     uint32_t batch,
     int64_t stride_a, int64_t stride_b, int64_t stride_c);
 
+// hipBLAS 翻译专用入口: B 物理布局为 column-major (等价 vkblas TB=1 直读),
+// 允许 op_b==N 免转置直通 (hipblas col-major 内存 + 加法交换律恒等);
+// 引擎直连 (row-major 契约) 必须用 vkblas_gemm_bf16 (永远转置)
+vkblas_status_t vkblas_gemm_bf16_hipblas(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c);
+
 // fp16 GEMM: 语义同 f32, 但 A/B/C 为 fp16 (2B/元素)
 // 内部: fp16 → fp32 (unpackHalf2x16) → fp32 GEMM → fp32 → fp16 回写 (RNE)
 vkblas_status_t vkblas_gemm_f16(

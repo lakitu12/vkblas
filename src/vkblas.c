@@ -45,6 +45,7 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     VkPipeline pipe128x64[4]; // 128×64 tile (实验保留, 默认不选)
     VkPipeline pipe128v9[4]; // v9: 128×128 + 无冲突读 (64 acc) — fp32 128-tile 路径默认
     VkPipeline pipe128v9h[2][4]; // v9h: 2B 直通 + v9 无冲突读 — f16/bf16 128-tile 路径默认
+    VkPipeline pipe128v9hp[4]; // v9hp: 2B 打包 LDS 主循环 (bf16, 破 LDS 带宽墙) — bf16 128-tile 首选
     VkPipeline pipe128v10h[2][4]; // 128×128 2B 真打包 LDS 直通 (实验保留, 默认不选)
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
     // [0]=fp16, [1]=bf16; 每 dtype 4 变体 + 转置
@@ -324,6 +325,20 @@ static void init_vkblas(void) {
             vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp9, NULL, &g.pipe128v9h[d][i]), "h128v9h pipe");
             vkDestroyShaderModule(g.dev, sm, NULL);
         }
+    }
+
+    // v9hp 2B 打包 LDS (bf16 首选: 主循环 LDS 流量减半; 缺 shader 回退 v9h)
+    static const char* hp128names[4] = { "gemm128v9hp_b16_nn.spv", "gemm128v9hp_b16_nt.spv",
+                                         "gemm128v9hp_b16_tn.spv", "gemm128v9hp_b16_tt.spv" };
+    for (int i = 0; i < 4; i++) {
+        g.pipe128v9hp[i] = VK_NULL_HANDLE;
+        if (load_spv(hp128names[i], &sm) != 0) continue;
+        VkComputePipelineCreateInfo hpp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                       VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+            .layout = g.pl };
+        vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hpp, NULL, &g.pipe128v9hp[i]), "h128v9hp pipe");
+        vkDestroyShaderModule(g.dev, sm, NULL);
     }
 
     VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 72 };  // GEMM 3+转置 2+cvt 8×2+实例 8×2+cx 2×3+cmb 4+cz 3+cm64 4
@@ -1106,6 +1121,7 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
                          uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                          float alpha, float beta, int submit) {
     // v9h 为默认 2B 直通变体 (v9 无冲突主循环); shader 缺失时回退 v7h
+    // (v9hp 打包变体: 加载保留作对照, 实测证伪不启用 — 见 gemm_tmpl_128_v9hp.comp 头注释)
     VkPipeline pipe = g.pipe128v9h[dtype][variant] != VK_NULL_HANDLE
                         ? g.pipe128v9h[dtype][variant] : g.pipe128_h[dtype][variant];
     if (pipe == VK_NULL_HANDLE) return -1;
@@ -1218,7 +1234,7 @@ static int run_fused_f32_transpose_gemm(int use128, int variant,
 
 // 直通 batch 合并 (f16/bf16): 一次 import 全 batch + 一次转置 + 一次 dispatch (z=batch)
 // 要求 stride_c 偶 (写 C 对不变式: e = b*stride_c + row*ldc + cc 恒偶); 跨分配 → FALLBACK
-static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_op_t op_b,
+static vkblas_status_t gemm_h_direct_merged(int dtype, int hip_physical, vkblas_op_t op_a, vkblas_op_t op_b,
                                             uint32_t M, uint32_t N, uint32_t K,
                                             float alpha,
                                             const void* A, uint32_t lda,
@@ -1245,10 +1261,25 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_
     int rc = 0;
     if (op_b == VKBLAS_OP_N) {
         int use128 = pick_tile128(M, N);
-        rc = run_fused_half_transpose_gemm(dtype, use128, variant,
-                                           bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
-                                           M, N, K, lda, ldb, ldc, batch,
-                                           stride_a, stride_b, stride_c, alpha, beta);
+        // 免转置直通仅 hipblas 物理布局 (col-major) + bf16: B 内存 = (N×K) 列主序, TB=1 直读合法;
+            // 引擎直连 (hip_physical=0, rm 契约) 永远走转置。f16 直通存在布局结构错, 暂禁 (2026-08-26)
+                int od = hip_physical && dtype == 1 && (lda & 1u) == 0 && (ldb & 1u) == 0 &&
+                         (stride_a & 1) == 0 && (stride_b & 1) == 0;
+        if (od) {
+            if (use128)
+                rc = run_gemm_h128(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
+                                   M, N, K, lda, ldb, ldc, batch,
+                                   stride_a, stride_b, stride_c, alpha, beta, 1);
+            else
+                rc = run_gemm_h(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
+                                M, N, K, lda, ldb, ldc, batch,
+                                stride_a, stride_b, stride_c, alpha, beta, 1);
+        } else {
+            rc = run_fused_half_transpose_gemm(dtype, use128, variant,
+                                               bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
+                                               M, N, K, lda, ldb, ldc, batch,
+                                               stride_a, stride_b, stride_c, alpha, beta);
+        }
     } else if (pick_tile128(M, N)) {
         rc = run_gemm_h128(dtype, variant, bA, ba_all * 2, bB, bb_all * 2, bC, bc_all * 2,
                            M, N, K, lda, ldb, ldc,
@@ -1265,7 +1296,7 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, vkblas_op_t op_a, vkblas_
 // 直通 GEMM 主路径 (f16/bf16, llama.cpp mul_mm 思路): 2B 半精度 A/B/C 直接进 shader
 // host 保证 ldc 偶 && N 偶; op_b==N 时 B 先 transpose_h (输出行步长 pad 偶)
 // dtype: 0 = fp16, 1 = bf16; 调用方持锁
-static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op_b,
+static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op_a, vkblas_op_t op_b,
                                      uint32_t M, uint32_t N, uint32_t K,
                                      float alpha,
                                      const void* A, uint32_t lda,
@@ -1301,7 +1332,7 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
         int rc = 0, fallback = 0;
         while (rem > 0) {
             uint32_t nb = rem > 16 ? 16 : rem;
-            rc = gemm_h_direct_merged(dtype, op_a, op_b, M, N, K,
+            rc = gemm_h_direct_merged(dtype, hip_physical, op_a, op_b, M, N, K,
                                       alpha, pa2, lda, pb2, ldb, beta, pc2, ldc,
                                       nb, stride_a, stride_b, stride_c);
             if (rc == VKBLAS_OK) {
@@ -1351,10 +1382,25 @@ static vkblas_status_t gemm_h_direct(int dtype, vkblas_op_t op_a, vkblas_op_t op
         }
         if (op_b == VKBLAS_OP_N) {
             int use128 = pick_tile128(M, N);
-            rc = run_fused_half_transpose_gemm(dtype, use128, variant,
-                                               bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
-                                               M, N, K, lda, ldb, ldc, 1,
-                                               0, 0, 0, alpha, beta);
+            int od = hip_physical && dtype == 1 && (lda & 1u) == 0 && (ldb & 1u) == 0;
+            if (od) {
+                if (getenv("VKBLAS_TRACE"))
+                    fprintf(stderr, "[vk] %s op_b=N DIRECT (no transpose) variant=%d lda=%u ldb=%u M=%u N=%u K=%u\n",
+                            dtype ? "bf16" : "f16", variant, lda, ldb, M, N, K);
+                if (use128)
+                    rc = run_gemm_h128(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                       M, N, K, lda, ldb, ldc, 1,
+                                       0, 0, 0, alpha, beta, 1);
+                else
+                    rc = run_gemm_h(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                    M, N, K, lda, ldb, ldc, 1,
+                                    0, 0, 0, alpha, beta, 1);
+            } else {
+                rc = run_fused_half_transpose_gemm(dtype, use128, variant,
+                                                   bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
+                                                   M, N, K, lda, ldb, ldc, 1,
+                                                   0, 0, 0, alpha, beta);
+            }
         } else if (pick_tile128(M, N)) {
             // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
             int okt = 0;
@@ -2783,7 +2829,7 @@ vkblas_status_t vkblas_gemm_f32(
 
 // bf16 GEMM 回退: A/B/C (bf16, 2B/元素) → 内部 fp32 → fp32 GEMM → 回写 bf16
 // op_b==N 时 cvt 直接输出转置 (N×K 紧密) 走 TB=1 快路径 (省独立转置)
-vkblas_status_t vkblas_gemm_bf16(
+static vkblas_status_t gemm_bf16_core(int hip_physical,
     vkblas_op_t op_a, vkblas_op_t op_b,
     uint32_t M, uint32_t N, uint32_t K,
     float alpha,
@@ -2831,8 +2877,9 @@ vkblas_status_t vkblas_gemm_bf16(
 
     // ---- 直通快路径 (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer) ----
     // 条件: ldc 偶 && N 偶 (否则行尾/行首跨 uint 竞争); bf16 直通 pipeline 可用
+    // 引擎直连 (rm 契约): hip_physical=0 → op_b==N 永远转置 (免转置仅 hipblas 入口)
     if ((ldc & 1u) == 0 && (N & 1u) == 0 && g.pipe_h[1][0] != VK_NULL_HANDLE) {
-        int rc = gemm_h_direct(1, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+        int rc = gemm_h_direct(1, hip_physical, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
                                batch, stride_a, stride_b, stride_c);
         pthread_mutex_unlock(&g.lock);
         return rc;
@@ -2921,6 +2968,36 @@ vkblas_status_t vkblas_gemm_bf16(
     return VKBLAS_OK;
 }
 
+// 引擎直连入口 (row-major 契约, B 物理 = 契约): op_b==N 永远转置
+vkblas_status_t vkblas_gemm_bf16(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    return gemm_bf16_core(0, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                          batch, stride_a, stride_b, stride_c);
+}
+
+// hipBLAS 翻译专用入口 (B 物理 = column-major): op_b==N 且步长偶时免转置直通 (TB=1 直读)
+vkblas_status_t vkblas_gemm_bf16_hipblas(
+    vkblas_op_t op_a, vkblas_op_t op_b,
+    uint32_t M, uint32_t N, uint32_t K,
+    float alpha,
+    const void* A, uint32_t lda,
+    const void* B, uint32_t ldb,
+    float beta,
+    void* C, uint32_t ldc,
+    uint32_t batch,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    return gemm_bf16_core(1, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                          batch, stride_a, stride_b, stride_c);
+}
+
 // fp16 GEMM 回退: A/B/C (fp16, 2B/元素) → 内部 fp32 → fp32 GEMM → 回写 fp16
 // 管道同 bf16 (cvt 索引 4/6/7), 位转换不同: unpackHalf2x16/packHalf2x16 (RNE)
 // op_b==N 时 cvt 后单独转置 (transpose.comp 快路径) 走 TB=1
@@ -2970,7 +3047,7 @@ vkblas_status_t vkblas_gemm_f16(
 
     // ---- 直通快路径 (fp16): 条件同 bf16 (ldc 偶 && N 偶) ----
     if ((ldc & 1u) == 0 && (N & 1u) == 0 && g.pipe_h[0][0] != VK_NULL_HANDLE) {
-        int rc = gemm_h_direct(0, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+        int rc = gemm_h_direct(0, 0, op_a, op_b, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
                                batch, stride_a, stride_b, stride_c);
         pthread_mutex_unlock(&g.lock);
         return rc;

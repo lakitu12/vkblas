@@ -254,7 +254,7 @@ static hipblasStatus_t vk_gemm_bf16(hipblasHandle_t handle,
                 transA == HIPBLAS_OP_T ? "T" : "N", transB == HIPBLAS_OP_T ? "T" : "N",
                 m, n, k, lda, ldb);
     hipStreamSynchronize(g_stream);
-    vkblas_status_t st = vkblas_gemm_bf16(
+    vkblas_status_t st = vkblas_gemm_bf16_hipblas(
         transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         (uint32_t)n, (uint32_t)m, (uint32_t)k,
@@ -280,7 +280,7 @@ static hipblasStatus_t vk_gemm_strided_bf16(hipblasHandle_t handle,
     if (get_scalar_f32(alpha, &a) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
     if (get_scalar_f32(beta, &b) != 0) return HIPBLAS_STATUS_INVALID_VALUE;
     hipStreamSynchronize(g_stream);
-    vkblas_status_t st = vkblas_gemm_bf16(
+    vkblas_status_t st = vkblas_gemm_bf16_hipblas(
         transB == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         transA == HIPBLAS_OP_T ? VKBLAS_OP_T : VKBLAS_OP_N,
         (uint32_t)n, (uint32_t)m, (uint32_t)k,
