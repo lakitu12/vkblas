@@ -1263,9 +1263,11 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, int hip_physical, vkblas_
         int use128 = pick_tile128(M, N);
 
         // 免转置直通仅 hipblas 物理布局 (col-major) + bf16: B 内存 = (N×K) 列主序, TB=1 直读合法;
-                // 安全条件 (2026-08-26 补): col-major 物理的列数 = K, TB=1 把 n 当列索引 →
-                //   n ∈ [0,N') 必须落在列数内, 即 N' ≤ K; 对 A' (TA=0) 对称需要 M' ≤ K。
-                //   N'>K 场景直通越界读 (小 shape 曾被 hipMalloc 2MB 池掩盖, 大 shape 直崩)
+                // 安全条件 (2026-08-26): hipblas transA=N 时 A (m×k) col-major lda≥m,
+                //   TB=1 读域 (m-1)·ldb+k > 物理 (k-1)·ldb+m ⟺ m>k (N'>K) → 越界;
+                //   直通仅当 M'≤K && N'≤K (okm)。transA=T 侧 (op_b==T) 无此问题:
+                //   lda≥k 下读域 (m-1)·lda+k 恒等物理, 贴界 case 256x512x256 回归验证。
+                //   (小 shape 曾因 hipMalloc 池掩盖越界读, 大 shape 直崩 GPU fault)
                 int okm = (M <= K) && (N <= K);
                 int od = hip_physical && dtype == 1 && okm && (lda & 1u) == 0 && (ldb & 1u) == 0 &&
                          (stride_a & 1) == 0 && (stride_b & 1) == 0;
@@ -1323,9 +1325,8 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
     }
     size_t bc_e = (size_t)(M - 1) * ldc + N;
 
-    // 直通安全条件 (2026-08-26): col-major 物理的列数 = K, TA=1/TB=1 把 m/n 当列索引 →
-    //   m∈[0,M')/n∈[0,N') 必须落在列数内, 即 M'≤K && N'≤K; 不满足时直读越界
-    //   (小 shape 曾被 hipMalloc 2MB 池掩盖, 大 shape 直接 GPU fault), 需转置 B
+    // 直通安全条件 (2026-08-26, 同上注释): 仅 hipblas transA=N (op_b==N 直通) 需要;
+    //   op_b==T (transA=T) 读域恒等物理, 无越界 (贴界 case 256x512x256 NT 回归)
     int okm = (M <= K) && (N <= K);
     int use128 = pick_tile128(M, N);
 
@@ -1414,9 +1415,9 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
                                                    0, 0, 0, alpha, beta);
             }
         } else if (pick_tile128(M, N)) {
-            // 注: N'/M'>K 时 op_b==T 直跑 TB=1 读 col-major 物理理论上越界, 但实测
-            //   数值正确 (越界读落在 hipMalloc 池内大数据为 0); 转置修复实测 f16 回归
-            //   (130x258x70 NT nbad=255, 根因待查) — 2026-08-26 实验失败回滚, TODO
+            // op_b==T (hipblas transA=T): 直跑安全 — lda≥k 下 TB=1 读域 (m-1)·lda+k 恒等物理,
+            //   无越界 (贴界 case 256x512x256 NT 回归验证, 2026-08-26; 旧 TODO 已证伪)。
+            //   历史坑: 曾尝试转置修复 (f16 回归) 与缩小 bb_e (import 超读域), 均已回退。
             // VKBLAS_CACHE_TRANSPOSE && op_b==T: B (N×K,ldb) → (K×N) 缓存 → TB=0
             int okt = 0;
             if (op_b == VKBLAS_OP_T && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
