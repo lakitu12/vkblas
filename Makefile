@@ -1,5 +1,5 @@
 # vkblas — Vulkan 实现的 BLAS (hipBLAS ABI 兼容层)
-ROCM ?= /opt/rocm-6.4.3
+ROCM ?= /opt/rocm
 CC ?= gcc
 CFLAGS = -O2 -Wall -Wextra -fPIC -D__HIP_PLATFORM_AMD__ -I$(ROCM)/include -I src
 LDFLAGS = -L$(ROCM)/lib -Wl,-rpath,$(ROCM)/lib
@@ -59,7 +59,7 @@ SHADERS = $(SHADER_DIR)/gemm_nn.spv $(SHADER_DIR)/gemm_tn.spv \
           $(SHADER_DIR)/transpose_d64.spv \
           $(SHADER_DIR)/cvt_cz_planar.spv $(SHADER_DIR)/cx_combine_d64.spv \
 
-all: libvkblas_hipblas.so test/test_gemm test/test_h
+all: libvkblas_hipblas.so test/test_gemm test/test_h test/test_ic_cache
 
 # --- shader 4 变体 (TA/TB = A/B 因子是否转置读) ---
 $(SHADER_DIR)/gemm_nn.spv: $(SHADER_DIR)/gemm_tmpl.comp
@@ -300,18 +300,22 @@ test/bench_shapes: test/bench_shapes.c libvkblas_hipblas.so
 test/test_cache: test/test_cache.c src/vkblas.h libvkblas_hipblas.so
 	$(CC) $(CFLAGS) -o $@ test/test_cache.c -lhipblas -lamdhip64 $(LDFLAGS)
 
-clean:
-	rm -f libvkblas_hipblas.so test/test_gemm test/test_h test/test_cache $(SHADERS)
+# import 缓存表核心 host 单测 (零 GPU/驱动依赖, 不需 LD_PRELOAD): ./test/test_ic_cache
+test/test_ic_cache: test/test_ic_cache.c src/ic_cache.h
+	$(CC) $(CFLAGS) -o $@ test/test_ic_cache.c
 
-# --- 部署到本机 ROCm (/opt/rocm-6.4.3/lib) ---
+clean:
+	rm -f libvkblas_hipblas.so test/test_gemm test/test_h test/test_cache test/test_ic_cache $(SHADERS)
+
+# --- 部署到本机 ROCm (/opt/rocm/lib) ---
 # 安装版 .so 用 -DVKBLAS_SHADER_DIR 指向固定 shader 目录 (自包含, 不依赖源码树);
 # shaders 目录可被 VKBLAS_SHADER_DIR 环境变量覆盖
-SHADER_INSTALL ?= /opt/rocm-6.4.3/lib/vkblas-shaders
+SHADER_INSTALL ?= /opt/rocm/lib/vkblas-shaders
 install: libvkblas_hipblas.so
 	mkdir -p $(SHADER_INSTALL)
 	cp src/shaders/*.spv $(SHADER_INSTALL)/
-	$(CC) $(CFLAGS) -DVKBLAS_SHADER_DIR=\"$(SHADER_INSTALL)\" -shared -o /opt/rocm-6.4.3/lib/libvkblas_hipblas.so \
+	$(CC) $(CFLAGS) -DVKBLAS_SHADER_DIR=\"$(SHADER_INSTALL)\" -shared -o /opt/rocm/lib/libvkblas_hipblas.so \
 	    src/vkblas.c src/vkblas_hipblas.c -ldl -lpthread -lvulkan -lamdhip64 $(LDFLAGS)
-	@echo "installed: /opt/rocm-6.4.3/lib/libvkblas_hipblas.so (shaders -> $(SHADER_INSTALL))"
+	@echo "installed: /opt/rocm/lib/libvkblas_hipblas.so (shaders -> $(SHADER_INSTALL))"
 
 .PHONY: all clean install

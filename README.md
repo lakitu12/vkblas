@@ -80,8 +80,12 @@ env -u PYTHONPATH -u PYTHONHOME \
 3. HIP device pointers are exported as dma-buf fds
    (`hsa_amd_portable_export_dmabuf`) and imported into Vulkan as external
    memory — zero copy. Exports are cached per pointer (imports stay alive until
-   the HIP block is freed): the shim hooks `hipFree`/`hipHostFree`/`hipFreeManaged`
-   and invalidates cache entries by HIP block base, so a freed address that is
+   the HIP block is freed); cache eviction is ref-counted (`src/ic_cache.h`) —
+   a buffer held by an import/release window is never evicted, so an eviction
+   can never destroy a buffer a pending/in-flight submission still references.
+   The shim hooks `hipFree`/`hipHostFree`/`hipFreeManaged` and invalidates
+   cache entries by the freed pointer's true block base (`hsa_amd_pointer_info`,
+   which covers interior views of the allocation), so a freed address that is
    re-malloc'd always gets a fresh export. The cache self-enables only once a
    free hook call proves all frees in the process route through us (LD_PRELOAD);
    plain-`dlopen` processes keep the old per-call export/import behaviour.
@@ -111,9 +115,11 @@ env -u PYTHONPATH -u PYTHONHOME \
 src/vkblas.c            Vulkan engine (init, dma-buf import, GEMM/transpose)
 src/vkblas_hipblas.c    hipBLAS ABI shim (LD_PRELOAD)
 src/vkblas.h            public API
+src/ic_cache.h          dma-buf import cache core (holds refcount + host unit test)
 src/shaders/gemm_tmpl.comp   GEMM shader template (TA/TB → 4 variants)
 src/shaders/transpose.comp   row-major → column-major transpose
 test/test_gemm.c        C-level correctness (CPU reference)
+test/test_ic_cache.c    import-cache core host unit test (zero GPU)
 test/test_torch.py      PyTorch end-to-end + perf
 ```
 

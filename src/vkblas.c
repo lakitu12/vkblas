@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <vulkan/vulkan.h>
 #include <hip/hip_runtime_api.h>
+#include "ic_cache.h"   // import 缓存表核心 (host 单测: test/test_ic_cache.c)
 
 #ifndef VKBLAS_SHADER_DIR
 #define VKBLAS_SHADER_DIR "/home/lakitu/code/vkblas/src/shaders"
@@ -20,9 +21,23 @@ typedef hsa_status_t (*hsa_init_fn)(void);
 typedef hsa_status_t (*hsa_shut_fn)(void);
 typedef hsa_status_t (*hsa_export_dmabuf_fn)(const void* ptr, size_t size,
                                              int* dmabuf, uint64_t* offset);
+// hsa_amd_pointer_info (ROCm 稳定 API; 真块基址解析)。结构体与 hsa_ext_amd.h 的
+// hsa_amd_pointer_info_s 前缀布局一致 (size 版本化; 只读前 6 字段)。
+// 本文件整体自持 HSA 类型定义, 不 include <hsa/...> (避免头依赖)
+typedef struct {
+    uint32_t size;              // 调用前填 sizeof (ABI 版本控制)
+    int type;                   // hsa_amd_pointer_type_t (0 = UNKNOWN)
+    void* agentBaseAddress;     // 非 host agent 可见基址 (= 真块基址)
+    void* hostBaseAddress;
+    size_t sizeInBytes;
+    void* userData;
+} hsa_amd_pointer_info_t;
+typedef hsa_status_t (*hsa_pointer_info_fn)(const void* ptr, hsa_amd_pointer_info_t* info,
+                                            void* (*alloc)(size_t),
+                                            uint32_t* num_agents, void** accessible);
 
 // ---- 引擎状态 ----
-// dma-buf 导入缓存见 import_ptr/ic_*: 条目按 HIP 块基址失效 (hipFree hook), 见下
+// dma-buf 导入缓存见 import_ptr + ic_cache.h: 条目按真块基址失效 (hipFree hook), 见下
 static struct {
     int ready;
     VkInstance inst;
@@ -110,10 +125,14 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     hsa_init_fn hsa_init;
     hsa_shut_fn hsa_shut;
     hsa_export_dmabuf_fn hsa_export;
+    hsa_pointer_info_fn hsa_pointer_info;
 
     pthread_mutex_t lock;
     int init_done;
 } g;
+
+// import 缓存实例 (表核心见 src/ic_cache.h; init 于 init_vkblas; 使用点均在 g.lock 内)
+static ic_cache_t g_ic;
 
 static void vk_check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
@@ -123,6 +142,7 @@ static void vk_check(VkResult r, const char* what) {
 }
 
 static uint64_t now_us(void);  // 定义见 bf16 计时段 (VKBLAS_PROFILE/TRACE 用)
+static void ic_destroy_vk(void* ctx, VkBuffer b, VkDeviceMemory m);  // ic_cache 销毁回调 (定义见 import 缓存段)
 static int run_matvec_sk_m_vk(int dtype, const void* A, size_t ba, uint32_t lda,
                               VkBuffer bB, size_t bb, void* C, size_t bc, uint32_t ldc,
                               uint32_t K, uint32_t N, uint32_t ldb, uint32_t M,
@@ -144,6 +164,9 @@ static void* load_hsa(void) {
         return NULL;
     }
     g.hsa_shut = (hsa_shut_fn)dlsym(h, "hsa_shut_down");
+    g.hsa_pointer_info = (hsa_pointer_info_fn)dlsym(h, "hsa_amd_pointer_info");
+    if (!g.hsa_pointer_info)
+        fprintf(stderr, "[vkblas] hsa_amd_pointer_info missing -> import cache disabled (correctness-first)\n");
     return h;
 }
 
@@ -637,6 +660,7 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
 
+    ic_cache_init(&g_ic, ic_destroy_vk, NULL);
     g.ready = 1;
     g.init_done = 1;
     fprintf(stderr, "[vkblas] engine ready (Vulkan + HSA dma-buf interop)\n");
@@ -646,60 +670,69 @@ static void ensure_init(void) {
     if (!g.init_done) init_vkblas();
 }
 
-// 导出 HIP 指针为 dma-buf 并导入 Vulkan; 用完即释放 (不缓存)
-// vkblas 导出 (供 hipblas 层 hipFree/hipHostFree/hipFreeManaged hook 调用): 失效并释放
-// 所有底层 HIP 块基址 == base 的缓存条目 (含 base==NULL → 全清, 测试用)
-void vkblas_cache_invalidate_base(const void* base);
+// 导出 HIP 指针为 dma-buf 并导入 Vulkan (带条目缓存, 见下)
+// vkblas 导出 (供 hipblas 层 hipFree/hipHostFree/hipFreeManaged hook 调用): 传入被释放
+// 指针, 解析其真块基址后失效同块全部缓存条目 (含 interior view); ptr==NULL → 全清 (测试用)
+void vkblas_cache_invalidate_base(const void* ptr);
 // hipblas 层 free hook 的自证实门控: ==1 表示本进程 free 都经过我们 (可安全缓存)
 extern int vkblas_hook_active;
 
 // ===== dma-buf import 缓存 (小矩阵热路径: 免去每次 GEMM 的 export/create/alloc/bind) =====
-// 正确性模型 (上一版注释的"不能缓存"顾虑已解决):
-//   hipFree 后虚拟地址可能被复用给新分配 — 单凭指针无法区分"同一 VA 不同代"。
-//   因此缓存条目记录底层 HIP 块基址 (hipPointerGetAttributes().devicePointer),
-//   hipblas 层 hook hipFree(ptr) 时按块基址失效全部条目: 块被 free → 其所有 dma-buf
-//   引用立即释放, 复用后的新块必然重新 import。hook 漏网的 (HIP 内部 free) 由
-//   [守卫] base=NULL 的指针不缓存 兜底。
-//   命中成本 = 一次线性查表 (<1μs); miss 成本 = hipPointerGetAttributes (≈1μs) + 原导入。
-#define IC_CAP 256
-struct ic_entry {
-    void* ptr;              // 缓存 key (GEMM 传入的用户指针)
-    const void* base;       // 底层 HIP 块基址 (free hook 的失效键; 无法取得 → 不缓存)
-    size_t size;            // 创建时的 buffer 字节数
-    VkBuffer b;
-    VkDeviceMemory m;
-    VkDeviceSize off;       // dma-buf 内偏移
-};
-static struct ic_entry ic_tab[IC_CAP];
-static uint32_t ic_cnt = 0;
-static uint64_t ic_hits = 0, ic_misses = 0;
+// 表核心在 src/ic_cache.h (holds 引用计数 + 纯 host 单测 test/test_ic_cache.c; 2026-10-08 修复)。
+// 本文件保留 vkblas 侧胶水: 真块基址解析 / 销毁回调 / 外部失效包装。正确性模型 (修复版):
+//   - 条目按【真块基址】(hsa_amd_pointer_info().agentBaseAddress) 失效: hipFree hook 按
+//     被释放指针解析块基址 → 同块全部条目 (含 interior view) 立即失效。旧版用
+//     hipPointerGetAttributes().devicePointer — CLR 源码实锤它返回"问询地址本身"而非
+//     块基址 → 校验恒真 / interior view 漏失效 (ANALYSIS-crash-20261008.md 根因 #2)。
+//   - 每条目带 holds: import 返回句柄 +1, release_ptr -1; 逐出只销毁 holds==0 者
+//     → 在用条目 (同 op 早先导入 / 已被调用方持有) 永不被逐出 (根因 #1 崩溃修复)。
+//   - hook 漏网的 (HIP 内部 free) 由 [守卫] 块基址解析失败不缓存 兜底。
+//   命中成本 = 一次线性查表 (<1μs); miss 成本 = 一次 pointer_info (≈1μs) + 原导入。
 
-// 返回非 NULL 且可用于失效匹配的 HIP 块基址; 无法 vouch 时返回 NULL
+// 销毁回调 (仅经 ic_cache_* 在 g.lock 内调用)
+static void ic_destroy_vk(void* ctx, VkBuffer b, VkDeviceMemory m) {
+    (void)ctx;
+    vkDestroyBuffer(g.dev, b, NULL);
+    vkFreeMemory(g.dev, m, NULL);
+}
+
+// 真块基址解析 (非 NULL = 可缓存/可按块失效): hsa_amd_pointer_info 的
+// agentBaseAddress (device) / hostBaseAddress (host); UNKNOWN 或失败 → NULL
 static const void* ic_block_base(const void* ptr) {
-    hipPointerAttribute_t attr;
-    if (hipPointerGetAttributes(&attr, (hipDeviceptr_t)ptr) != hipSuccess) return NULL;
-    const void* base = attr.type == hipMemoryTypeHost ? attr.hostPointer : attr.devicePointer;
-    return base;
+    if (ptr == NULL || !g.hsa_pointer_info) return NULL;
+    hsa_amd_pointer_info_t info;
+    memset(&info, 0, sizeof info);
+    info.size = (uint32_t)sizeof info;
+    if (g.hsa_pointer_info(ptr, &info, NULL, NULL, NULL) != 0) return NULL;
+    if (info.type == 0 /* HSA_EXT_POINTER_TYPE_UNKNOWN */) return NULL;
+    return info.agentBaseAddress != NULL ? info.agentBaseAddress : info.hostBaseAddress;
 }
 
-// swap-remove 第 i 条并释放其 Vulkan 对象 (调用方须持锁)
-static void ic_drop(size_t i) {
-    vkDestroyBuffer(g.dev, ic_tab[i].b, NULL);
-    vkFreeMemory(g.dev, ic_tab[i].m, NULL);
-    ic_tab[i] = ic_tab[--ic_cnt];
-}
-
-// 释放所有底层块 == base 的条目 (base==NULL → 全清)
-void vkblas_cache_invalidate_base(const void* base) {
+// 失效 (hipFree/hipHostFree/hipFreeManaged hook 传入被释放指针; ptr==NULL → 全清, 测试用):
+// 解析被释放指针的真块基址 → 失效同块全部条目; 解析失败 → 保守按 同 ptr/同 base 清理。
+void vkblas_cache_invalidate_base(const void* ptr) {
     if (!g.ready) return;
     pthread_mutex_lock(&g.lock);
-    for (size_t i = 0; i < ic_cnt; ) {
-        if (base == NULL || ic_tab[i].base == base) ic_drop(i);
-        else i++;
+    const void* base = (ptr != NULL) ? ic_block_base(ptr) : NULL;
+    if (ptr == NULL) {
+        ic_cache_invalidate_base(&g_ic, NULL);
+    } else if (base != NULL) {
+        ic_cache_invalidate_base(&g_ic, base);
+    } else {
+        for (uint32_t i = 0; i < g_ic.cnt; ) {
+            if (g_ic.tab[i].ptr == ptr || g_ic.tab[i].base == ptr) {
+                ic_cache_drop(&g_ic, i);
+                g_ic.invalidated++;
+            } else i++;
+        }
     }
-    // 转置缓存同失效 (指针复用 → 陈旧转置危险)
+    // 转置缓存同失效 (同样按解析出的真块基址; 解析失败 → 按 ptr 兜底)
     for (int i = 0; i < g.tc_cnt; ) {
-        if (base == NULL || g.tc_tab[i].base == base) {
+        int match;
+        if (ptr == NULL) match = 1;
+        else if (base != NULL) match = (g.tc_tab[i].base == base);
+        else match = (g.tc_tab[i].ptr == ptr || g.tc_tab[i].base == ptr);
+        if (match) {
             if (g.tc_tab[i].b_kn) vkDestroyBuffer(g.dev, g.tc_tab[i].b_kn, NULL);
             if (g.tc_tab[i].m_kn) vkFreeMemory(g.dev, g.tc_tab[i].m_kn, NULL);
             if (g.tc_tab[i].b_nk) vkDestroyBuffer(g.dev, g.tc_tab[i].b_nk, NULL);
@@ -710,43 +743,28 @@ void vkblas_cache_invalidate_base(const void* base) {
     pthread_mutex_unlock(&g.lock);
 }
 
-// 注册新条目 (满则 FIFO 逐出最旧的)
-static void ic_add(const void* ptr, const void* base, size_t size,
-                   VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
-    if (ic_cnt >= IC_CAP) ic_drop(0);   // 简单 FIFO
-    struct ic_entry* e = &ic_tab[ic_cnt++];
-    e->ptr = (void*)ptr; e->base = base; e->size = size;
-    e->b = b; e->m = m; e->off = off;
-}
-
 static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
                       VkDeviceMemory* mem, VkDeviceSize* offset) {
     if (!g.ready) return -1;
     int profile = getenv("VKBLAS_PROFILE") != NULL;
     double t0 = profile ? now_us() : 0;
 
+    // 真块基址一次解析 (hit 校验与 miss 注册共用; hook 未证实或解析失败 → 不缓存)
+    const void* qbase = NULL;
     if (ptr != NULL && vkblas_hook_active) {
-        // ---- 缓存快路径: 同一 ptr 且 size 满足 → 直接复用 ----
-        // 双保险: 命中前校验底层 HIP 块基址仍一致 (hook 漏网场景兜底)
-        for (uint32_t i = 0; i < ic_cnt; i++) {
-            if (ic_tab[i].ptr == ptr) {
-                if (size <= ic_tab[i].size && ic_block_base(ptr) == ic_tab[i].base) {
-                    *buf = ic_tab[i].b; *mem = ic_tab[i].m; *offset = ic_tab[i].off;
-                    ic_hits++;
-                    if (getenv("VKBLAS_TRACE"))
-                        fprintf(stderr, "[vkblas] import cache HIT  ptr=%p size=%zu (cached=%zu, n=%u)\n",
-                                ptr, size, ic_tab[i].size, ic_cnt);
-                    return 0;
-                }
-                ic_drop(i);   // size 不够或块已变 → 作废重导
-                break;
-            }
+        qbase = ic_block_base(ptr);
+        // ---- 缓存快路径: ptr 匹配 + size 够 + 真块基址一致 → holds++ 复用 ----
+        // (在用条目由 holds 保护, 逐出绝不触碰 — 根因 #1 修复)
+        VkBuffer hb; VkDeviceMemory hm; VkDeviceSize ho;
+        if (ic_cache_hit(&g_ic, ptr, size, qbase, &hb, &hm, &ho) == 0) {
+            *buf = hb; *mem = hm; *offset = ho;
+            if (getenv("VKBLAS_TRACE"))
+                fprintf(stderr, "[vkblas] import cache HIT  ptr=%p size=%zu (n=%u)\n",
+                        ptr, size, g_ic.cnt);
+            return 0;
         }
     }
-
-    // 可缓存的先取块基址 (hook 未证实或无法 vouch → 不缓存, 每次全量导出)
-    const void* cbase = (ptr != NULL && vkblas_hook_active) ? ic_block_base(ptr) : NULL;
-    int cacheable = cbase != NULL;
+    int cacheable = qbase != NULL;
 
     int fd = -1;
     uint64_t off = 0;
@@ -818,10 +836,15 @@ static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
         }
     }
     if (cacheable) {
-        ic_add(ptr, cbase, size, b, m, off);
-        ic_misses++;
-        if (getenv("VKBLAS_TRACE"))
-            fprintf(stderr, "[vkblas] import cache MISS ptr=%p size=%zu (n=%u)\n", ptr, size, ic_cnt);
+        if (ic_cache_add(&g_ic, ptr, qbase, size, b, m, off) != 0) {
+            // 全表在用 (病态): 本条目不缓存; release 未命中 → 调用方流程照旧销毁
+            if (getenv("VKBLAS_TRACE"))
+                fprintf(stderr, "[vkblas] import cache REFUSED (all-held) ptr=%p size=%zu\n", ptr, size);
+        } else {
+            g_ic.misses++;
+            if (getenv("VKBLAS_TRACE"))
+                fprintf(stderr, "[vkblas] import cache MISS ptr=%p size=%zu (n=%u)\n", ptr, size, g_ic.cnt);
+        }
     }
     if (profile)
         fprintf(stderr, "[vkblas] prof: import ptr=%p size=%zu took %.2fms%s\n",
@@ -831,11 +854,9 @@ static int import_ptr(const void* ptr, size_t size, VkBuffer* buf,
 }
 
 static void release_ptr(VkDeviceMemory mem, VkBuffer buf) {
-    // 缓存条目由缓存持有生命周期 (hipFree hook / 容量逐出时统一释放), 这里只在
-    // 非缓存对象 (临时 buffer 等) 上真释放
-    for (uint32_t i = 0; i < ic_cnt; i++) {
-        if (ic_tab[i].b == buf && ic_tab[i].m == mem) return;
-    }
+    // 缓存条目生命周期归缓存 (hipFree hook / 满容逐出时销毁); 这里只归还 holds。
+    // 未命中 = 非缓存对象 (未缓存导入的临时 buffer 等) → 真释放。
+    if (ic_cache_release(&g_ic, buf, mem)) return;
     vkDestroyBuffer(g.dev, buf, NULL);
     vkFreeMemory(g.dev, mem, NULL);
 }
@@ -2818,16 +2839,19 @@ vkblas_status_t vkblas_gemm_f32(
                 VkBuffer bBt; size_t bt_sz; int tbuilt;
                 if (tc_get((const void*)pb, N, K, ldb, 0, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
                     VkBuffer bA3, bC3; VkDeviceMemory mA3, mC3; VkDeviceSize oA3, oC3;
-                    if (import_ptr(pa, ba, &bA3, &mA3, &oA3) == 0 &&
-                        import_ptr(pc, bc, &bC3, &mC3, &oC3) == 0) {
-                        (void)oA3; (void)oC3;
-                        if (use128)
-                            okt = run_gemm_vk128(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
-                                                 M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
-                        else
-                            okt = run_gemm_vk(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
-                                              M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
-                        release_ptr(mA3, bA3); release_ptr(mC3, bC3);
+                    if (import_ptr(pa, ba, &bA3, &mA3, &oA3) == 0) {
+                        // 嵌套 (非 && 短路): pc 导入失败时也必须 release A3 (holds 归还)
+                        if (import_ptr(pc, bc, &bC3, &mC3, &oC3) == 0) {
+                            (void)oA3; (void)oC3;
+                            if (use128)
+                                okt = run_gemm_vk128(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
+                                                     M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                            else
+                                okt = run_gemm_vk(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
+                                                  M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
+                            release_ptr(mC3, bC3);
+                        }
+                        release_ptr(mA3, bA3);
                     }
                 }
             }

@@ -10,6 +10,29 @@
 #include <hip/hip_runtime_api.h>
 #include <time.h>
 
+// ---------- 头文件代际兼容 (hipblas 3.x 新头 ↔ 6.4 系老头; 2026-10-08 为 v10 树构建补) ----------
+// 本源码按 6.4 系 hipblas 头写成。新头 (ROCm 7.x+/10.0 树, hipblas 3.x) 差异:
+//   ① hipblasDatatype_t 类型已删除 (HIPBLAS_R_* 仅剩宏且折叠到新值);
+//   ② _v2 后缀函数不再声明 —— 本文件自行实现并导出它们 (运行时真库 2.4.60403 也导出
+//      同名符号, dlsym 转发目标存在), 此处只缺编译期前向声明。
+#if defined(hipblasVersionMajor) && (hipblasVersionMajor >= 3)
+typedef hipDataType hipblasDatatype_t;
+hipblasStatus_t hipblasGemmEx_v2(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
+                                 int m, int n, int k, const void* alpha, const void* A, hipDataType aType, int lda,
+                                 const void* B, hipDataType bType, int ldb, const void* beta, void* C,
+                                 hipDataType cType, int ldc, hipblasComputeType_t computeType, hipblasGemmAlgo_t algo);
+hipblasStatus_t hipblasGemmStridedBatchedEx_v2(hipblasHandle_t handle,
+                                               hipblasOperation_t transA, hipblasOperation_t transB,
+                                               int m, int n, int k, const void* alpha, const void* A, hipDataType aType,
+                                               int lda, hipblasStride strideA, const void* B, hipDataType bType,
+                                               int ldb, hipblasStride strideB, const void* beta, void* C,
+                                               hipDataType cType, int ldc, hipblasStride strideC, int batchCount,
+                                               hipblasComputeType_t computeType, hipblasGemmAlgo_t algo);
+#define VKBLAS_GEMMEX_COMPUTE_T hipblasComputeType_t   // 新头 hipblasGemmEx 的 computeType 类型
+#else
+#define VKBLAS_GEMMEX_COMPUTE_T hipblasDatatype_t      // 老头: 老式签名
+#endif
+
 static double now_s(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
@@ -233,9 +256,11 @@ static int is_fp32_ex(hipDataType t, hipblasComputeType_t c) {
     return (t == HIP_R_32F) &&
            (c == HIPBLAS_COMPUTE_32F || c == HIPBLAS_COMPUTE_32F_PEDANTIC);
 }
-// 通吃 HIPBLAS_V2 两种模式: HIP_R_16BF=14; legacy hipblasDatatype_t HIPBLAS_R_16B=168
-static int is_bf16_ex(hipDataType t) { return (int)t == HIP_R_16BF || (int)t == HIPBLAS_R_16B; }
-static int is_fp16_ex(hipDataType t) { return (int)t == HIP_R_16F || (int)t == HIPBLAS_R_16F; }
+// 通吃两种 API 代际的数值: 新 hipDataType (HIP_R_16BF=14 / HIP_R_16F=2) 与老 hipblasDatatype_t
+// (HIPBLAS_R_16B=168 / HIPBLAS_R_16F=150)。老值固化字面量: 新头把 HIPBLAS_R_* 折叠成新值宏,
+// 只依赖宏会丢老代际比较; 加字面量在两种头下均为同值补腿, 双保险。
+static int is_bf16_ex(hipDataType t) { return (int)t == HIP_R_16BF || (int)t == HIPBLAS_R_16B || (int)t == 168; }
+static int is_fp16_ex(hipDataType t) { return (int)t == HIP_R_16F || (int)t == HIPBLAS_R_16F || (int)t == 150; }
 
 // ---------- bf16 GEMM 回退 (Vulkan) ----------
 // 与 vk_gemm_f32 相同的 column-major → row-major 翻译; A/B/C 为 bf16
@@ -408,7 +433,7 @@ hipblasStatus_t hipblasGemmStridedBatchedEx_v2(hipblasHandle_t handle,
 hipblasStatus_t hipblasGemmEx(hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
                               int m, int n, int k, const void* alpha, const void* A, hipblasDatatype_t aType,
                               int lda, const void* B, hipblasDatatype_t bType, int ldb, const void* beta,
-                              void* C, hipblasDatatype_t cType, int ldc, hipblasDatatype_t computeType,
+                              void* C, hipblasDatatype_t cType, int ldc, VKBLAS_GEMMEX_COMPUTE_T computeType,
                               hipblasGemmAlgo_t algo) {
     if (!handle) return HIPBLAS_STATUS_INVALID_VALUE;
     if (is_bf16_ex(aType) && is_bf16_ex(bType) && is_bf16_ex(cType))
