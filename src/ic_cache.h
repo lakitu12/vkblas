@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <vulkan/vulkan.h>
 
-#define IC_CAP 256
+#define IC_CAP 2048
 
 typedef struct {
     void* ptr;              // 缓存 key (GEMM 传入的用户指针)
