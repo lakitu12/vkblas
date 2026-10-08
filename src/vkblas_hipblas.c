@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   // RTLD_NEXT: dlsym 转发目标解析 (2026-10-08 修显存不回收)
 // vkblas_hipblas.c — hipBLAS ABI 兼容层 (LD_PRELOAD 劫持)
 // 热路径 (fp32 GEMM) → Vulkan; 其余 → dlsym 转发真 libhipblas
 // 所有签名严格对齐 /opt/rocm-6.4.3/include/hipblas/hipblas.h (v1 int 参数)
@@ -138,19 +139,39 @@ static int get_scalar_f32(const void* p, float* out) {
 // 场景下 free 会绕过我们 → 缓存永久禁用, 退回每次全量导入 (正确性优先)。
 int vkblas_hook_active = 0;
 
+// 兜底解析 (仅当 RTLD_NEXT 失败时用): 首选进程实际使用的 .so.7
+// (2026-10-08 实测: 本机 .so.6 是兼容槽 symlink → ...bb6fb389f 那是【另一实例】,
+//  其 hipFree 对非本实例分配 rc=0 但静默不释放 → 显存只增不减; 详见 ANALYSIS 末章)
 static void* real_amdhip(void) {
     static void* h = NULL;
     if (!h) {
-        h = dlopen("libamdhip64.so.6", RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) h = dlopen("/opt/rocm/lib/libamdhip64.so.6", RTLD_LAZY | RTLD_GLOBAL);
+        h = dlopen("libamdhip64.so.7", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("/opt/rocm/lib/libamdhip64.so.7", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("libamdhip64.so.6", RTLD_LAZY | RTLD_GLOBAL);
     }
     return h;
 }
 
+// 转发目标: 必须 dlsym(RTLD_NEXT) —— 本 .so 由 LD_PRELOAD 插在搜索序最前,
+// RTLD_NEXT 给出"本对象之后的下一份定义" = 进程真正链接/使用的那份 libamdhip64。
+// 旧实现按名字 dlopen("libamdhip64.so.6") 命中兼容槽那一份【另一个实例】→ 转发出去的
+// free 静默 no-op (rc=0 但不释放) → 进程显存只增不减 (全服务端第 2 图 OOM 的根因)。
+// 自检: 解析失败/首调用打印一次真实地址, 绝不静默。
 #define HOOK_FREE(fname)                                                     \
     hipError_t fname(void* ptr) {                                            \
         static hipError_t (*real)(void*) = NULL;                             \
-        if (!real) real = (hipError_t(*)(void*))dlsym(real_amdhip(), #fname);\
+        static int resolved = 0;                                             \
+        if (!resolved) {                                                     \
+            resolved = 1;                                                    \
+            real = (hipError_t(*)(void*))dlsym(RTLD_NEXT, #fname);           \
+            if (!real) real = (hipError_t(*)(void*))dlsym(real_amdhip(), #fname); \
+            if (!real)                                                       \
+                fprintf(stderr, "[vkblas] FATAL: real " #fname " unresolved "\
+                                "(RTLD_NEXT + fallback NULL) — free 将无效!\n"); \
+            else                                                             \
+                fprintf(stderr, "[vkblas] " #fname " -> real=%p (RTLD_NEXT)\n", \
+                        (void*)real);                                        \
+        }                                                                    \
         vkblas_hook_active = 1;                                              \
         if (getenv("VKBLAS_TRACE"))                                          \
             fprintf(stderr, "[vkblas] %s hook: %p (cache active)\n", #fname, ptr); \

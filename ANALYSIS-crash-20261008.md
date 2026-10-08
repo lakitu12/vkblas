@@ -101,7 +101,7 @@ attributes->devicePointer = devMem->virtualAddress() + offset;   // = 问询地�
 
 # 【修复实施 + 验证记录】(2026-10-08 当天)
 
-## 修复内容 (repo 工作树, 未提交)
+## 修复内容 (本地 commit 4cc07a5, 未 push)
 1. **缓存表核心抽到 `src/ic_cache.h`** (纯 host 可测):
    - 每条目 `holds` 引用计数: import 返回句柄 +1, `release_ptr` 归还 -1;
    - **逐出只销毁 holds==0 的条目** (根因 #1 修复: 在用条目——同 op 早先导入 / 已被调用方持有——永不被逐出);
@@ -127,16 +127,159 @@ attributes->devicePointer = devMem->virtualAddress() + offset;   // = 问询地�
 | test_gemm (烟测) | ALL PASS 95/0 | fp32 全形状 + merged + batch |
 | test_cache 新 vs 老 A/B | **两版逐项一致** (ALL PASS, HIT=0/MISS=3) | HIT=0 系测试性质 (场景 A 在 hook 激活前; B 仅一次导入) |
 | test_h 新×2 / 老×2 | 新 2/2 过; 老 1/2 复现同 case FAIL (6.25e-2) | 无种子随机 + bf16 1-ulp 边界抖动 → **非回归** |
+| **满容复现 (受控, NEW)** | **DONE-CLEAN, faults 0/0** | **满容量插入 793 次 + HIT 593 + REFUSED 0** —— 旧版必崩条件反复执行零异常 (vkblas_repro_run.log) |
 | 失效探针 (30 轮 free/reuse) | ALL-OK; hook 61 次; 180 import 全 MISS | reuse 0/30 (本进程未回池 — 弱覆盖, 记局限) |
 | faults (boot 起) | 0 | — |
 
 ## 待办 (上机门)
-- [ ] **受控满容复现** `~/code/probes/vkblas_cache_overflow_repro.py` (需用户在场; 旧版在该脚本阶段 1 即应崩, 新版预期 DONE-CLEAN)
+- [x] **受控满容复现** (10-08 00:50): NEW DONE-CLEAN, faults 0; 满容量插入 793 次 / HIT 593 / REFUSED 0
+- [x] **部署** (10-08): /opt/rocm/lib/libvkblas_hipblas.so md5 `47f07c4e` (install 版, 内嵌 shader 路径); 旧版备份 `~/rocm-gfx803-archive/vkblas/libvkblas_hipblas.so.bak-4298ef1a`; 部署版零环境冒烟通过 (shader-not-found 0 条)
+- [x] **本地 commit** `4cc07a5` (未 push; 8 文件 +654/-106)
 - [ ] 全服务端跑图 (r10_shim + vkblas 修复版) 与 OLD 对照 (含 CLIP 分叉复验)
-- [ ] 部署 `sudo make install` (→ /opt/rocm/lib + vkblas-shaders; 覆盖前备份 4298ef1a)
 - [ ] 遗留 (可选): IC_CAP 提升 + LRU; stride uint32 截断
 
 ## 产物索引
 - 源码: `src/ic_cache.h`(新), `test/test_ic_cache.c`(新), `src/vkblas.c`(ic 段重写), `src/vkblas_hipblas.c`(兼容块), Makefile/README/vkblas.h
 - 探针与脚本 (~/code/probes/): `vkblas_fix_smoke.sh`, `vkblas_ab_check.sh`, `vkblas_cache_overflow_repro.py`,
   `vkblas_invalidation_probe.py`, `hsa_pointer_info_probe.c`; 日志 `_smoke_*` / `_ab_*` / `_inval_probe.log` / `vkblas_fix_smoke.log` / `vkblas_ab.log`
+
+---
+
+# 【全服务端验证 — 门槛通过】(2026-10-08 上午, 实测)
+
+夹具: `~/code/probes/run_vkblas_fullserver.py` (r10_shim/main.py 可换 + LD_PRELOAD + SD1.5 API workflow;
+     逐级 fsync 落盘 / 显存采样 / 每轮查内核 fault / 命中即停 / 留存 journal+devcoredump)
+工作流: `~/code/probes/workflows/sd15_dump.json` (512×512, 20 steps, euler, seed 1/2, ckpt v1-5 fp16)
+日志: `~/code/probes/runlogs/vkfs_{base,base2,new,new2,ref28}_*` (driver.log / server.log / summary.json)
+
+## 结果表 (全部 faults 全程 0, 无 VM fault / 无 ring timeout / 无挂机)
+| 臂 | 配置 | 出图 | 显存峰值→出图后 | 缓存证据 |
+|---|---|---|---|---|
+| A | 2.14 不挂 vkblas, cpu-vae | 20/20 步完成但**全黑** 2001B (271.8s) | — | 无 |
+| A2 | 同上 ×2 图 | 两图均黑 2002B, **无 OOM** | 4.9–5.3G → 3.3–3.7G | 无 |
+| **B** | **2.14 + shim + vkblas 修复版 47f07c4e** | **正常图** 517879B mean113.584 std69.491 min0 max255 (277s) | — | MISS=21000 HIT=10821 REFUSED=0 hook=176 **n_max=256** |
+| B2 | 同上复跑 ×2 图 | 像素与 B **完全相同** (相关1.000000 maxdiff=0); 第2图 OOM | **7.9–8.0G → 7817M(不回落)** | MISS=20996 HIT=10054 REFUSED=0 hook=173 n_max=256 |
+| D | **2.8 轮子 (已知能出图)** 同种子 | 517788B mean113.427 std69.498 (278s) | 4.5G → 2927M | 无 |
+
+**端到端像素比对**: vkblas修复版 vs 2.8轮子 = **相关 0.999397**, 平均|差| 1.05/255, 差>8 像素 2.05% ;
+基线(黑) vs 2.8轮子 = **相关 0.000**。⇒ 修复版全服务端数值链与"已知能出图"路径等价 (CLIP 条件若坏不可能 0.9994 ⇒ 18p 的 CLIP 分叉线索随此收口)。
+
+## 算子级定位 (CPU-RNG 输入消除污染; `nan_scan2.py` / `rng_case.py`)
+| 算子 | 官方路径 | vkblas 修复版 |
+|---|---|---|
+| **fp16 einsum("b i d,b j d->b i j") 全量 b16/i1024/j4096/d40** | **相对误差 1.0 (输出全零 → NaN → 黑图)** | ✓ 7.6e-4 |
+| fp16 einsum slice (非连续 q[:, :1024]) | ✓ 3.8e-4 | ✓ |
+| fp32 matmul 512² / fp16 matmul 512² | ✓ 8e-7 / 2.8e-4 | ✓ 2.75e-7 / 5.6e-4 |
+| silu / add / GroupNorm(fp32) | ✓ 精确 | ✓ 精确 |
+| GPU randn (fp32/fp16) | ✓ 两臂逐值一致, 非零 | ✓ |
+⇒ **官方路径上唯一坏的就是 fp16 `bmm`(strided-batched) 全量形状** —— 正是历史崩溃现场那条链
+(`vkblas_gemm_f16 ← rocblas_gemm_strided_batched_ex ← torch bgemm→baddbmm→einsum`); vkblas 自实现它 ⇒ 出正常图。
+(vkblas 修复版在全服务端顺带修掉"官方 rocBLAS 出不了图"这一现象。)
+
+## 新发现 (非崩溃, 待修): vkblas 常驻显存 +~3GB
+- vkblas 臂显存运行中即打满 ~7.9–8.0G 且**出图后不回落** (7817M); 基线/2.8 轮子出图后回落 (3.3G/2.9G)。
+- 后果: 8G 卡上**第 2 张图必 OOM** (`Tried to allocate 16MiB`, 剩 100MiB, torch 仅占 1.50GiB) —— 是**容量问题非崩溃**。
+- 时相: 占满发生在 t≈30s 后保持平坦 ⇒ 更像"固定多占 ~3G"(256 条 import 缓存 + Vulkan 侧开销)而非泄漏 (**推断, 未做归因实验**)。
+- 候选修法: IC_CAP 降/LRU 化、prompt 结束后主动 flush 缓存、按 VRAM 压力降级不缓存。
+
+## 未做 (需用户拍板)
+- [ ] **OLD 对照臂** (旧 .so 4298ef1a 全服务端 或 受控满容复现): 预计必崩/可能挂机, 需用户手动硬重启 ⇒ 等指令
+      (历史证据已足够: 同配置旧 .so 崩在 RADV, 10 条 VM fault, `MISS (n=256)`; 报告上半部分即该次分析)
+- [ ] 显存 +3G 归因与修复
+
+---
+
+# 【显存 +3G / 第2图 OOM — 根因已定性】(10-08 上午, 全程零风险级: host + 小 shape 探针, faults 0)
+
+**结论: 不是缓存设计问题, 而是 `HOOK_FREE` 把 free 转发到了错误的 HIP 运行时 ⇒ 带 vkblas 时
+进程内每一次 hipFree 都【静默不释放】且返回成功。**
+
+## 证据链 (全部本机实测)
+1. `src/vkblas_hipblas.c:141 real_amdhip()` 只按名字 dlopen **libamdhip64.so.6**;
+   本机该名字是兼容槽 symlink → `/opt/rocm/lib/libamdhip64.so.7.15.26333-bb6fb389f`,
+   而 torch 实际链接/使用的是 `libamdhip64.so.6/.7` 之外那份 `.so.7 → ...0000000`
+   ⇒ 进程内**同时映射两份 libamdhip64** (maps 实测: `...0000000` 4 段 + `...bb6fb389f` 5 段)。
+2. 直调两份 runtime 的 hipFree 对**真 hipMalloc 分配**(torch.cuda.caching_allocator_alloc):
+   | runtime | rc | 显存回降 |
+   |---|---|---|
+   | `.so.6` (bb6fb389f) | **0 (成功)** | **0–2M (静默 no-op)** |
+   | `.so.7` (0000000) | 0 | **512M ✓ (真释放)** |
+3. `hook_free_test`: 全局作用域 hipFree (有 preload 时 = vkblas hook) → **rc=0 但回降 0M**。
+4. `vram_attr2` (300×5MiB + 300×1.25MiB, 全部被 import 过): 无 preload 释放后回降 1791M;
+   有 vkblas **回降 0M**。⇒ 与"缓存条目钉住"无关 (条目自身仅 ~0.35MiB/条: 两臂 ops 后差 5M)。
+
+## 机理与影响
+- torch 的 free (empty_cache / 块回收 / 释放张量) → 被 hook 拦截 → 转发给 `.so.6` 实例 →
+  该实例不拥有这些分配 → **返回成功但什么都没做** → 显存只增不减。
+- 全服务端表现与此完全吻合: 第 1 张图运行中即打到 ~8.0G 并**出图后停在 7.8G 不回落**
+  (基线出图后回落 3.3G) ⇒ 第 2 张图 OOM (容量问题, **非崩溃**, faults 全程 0)。
+- 一般化: **任何 GPU 分配只要 vkblas 在场都不会真正归还** —— 长命进程会持续吃满显存。
+
+## 修法 (建议, 未实施)
+把 HOOK_FREE 的转发从"猜库文件名"改为**进程内正确的下一份定义**:
+```c
+#define _GNU_SOURCE            // 需要 RTLD_NEXT
+#define HOOK_FREE(fname)                                                    \
+    hipError_t fname(void* ptr) {                                           \
+        static hipError_t (*real)(void*) = NULL;                            \
+        if (!real) real = (hipError_t(*)(void*))dlsym(RTLD_NEXT, #fname);   \
+        if (!real) { /* 显式报错, 别再静默 */ }                              \
+        ...
+```
+并加**自检**: 若 `real == NULL` 或首次调用返回值异常要打日志 (现行实现静默返回 hipErrorRuntimeMemory)。
+验证顺序: host 单测 → 冒烟 → 全服务端 3 张图 (期望: 显存出图后回落, 无 OOM, faults 0)。
+回退: 保留现部署版 47f07c4e (archive 里另有 4298ef1a)。
+
+---
+
+# 【显存修复实施 + 验证】(10-08 中午) —— 已部署 md5 ae5d0958
+
+## 改动 (src/vkblas_hipblas.c)
+1. `#define _GNU_SOURCE`; `HOOK_FREE` 的转发目标改为 **`dlsym(RTLD_NEXT, #fname)`**
+   (本 .so 由 LD_PRELOAD 插在搜索序最前 ⇒ RTLD_NEXT = 进程真正使用的那份 libamdhip64),
+   并在解析失败/首次解析时打印真实地址 (不再静默返回 hipErrorRuntimeMemory)。
+2. 兜底 `real_amdhip()` 由 `.so.6` 改为**首选 `.so.7`** (本机 .so.6 是兼容槽 symlink → 另一实例)。
+
+## 证据 (修前 → 修后, 同探针)
+| 检查 | 修前 (47f07c4e) | 修后 (ae5d0958) |
+|---|---|---|
+| hook 转发目标 | .so.6 实例 (地址 0x...7056a0) | **.so.7 实例 (地址 = .so.7 的 hipFree, 逐地址相等)** |
+| `hook_free_test` 真分配 free | rc=0 但回降 **0M** | rc=0 回降 **514M** ✓ |
+| `vram_attr2` 释放后 | 2698M (**回降 0M**) | **1115M (回降 1796M)** ≈ 无 preload 臂 1791M ✓ |
+| host 单测 `test_ic_cache` | ALL PASS | ALL PASS (destroyed=4) |
+| 烟测 (test_gemm/test_cache/test_h) | 95/0 + PASS + 0 失败 | **同** (faults 0) |
+| **全服务端 3 张图** | 第 2 张 OOM | **3/3 完成, 无 OOM**; 出图后显存 3151/3223M (修前停 7817M); MISS=59435 HIT=28987 REFUSED=0 n_max=256; **faults 全程 0** |
+| 数值回归 | — | 同种子图与修前 **逐像素完全一致 (max|diff|=0, 相关 1.000000)**; 与 2.8 轮子仍 0.999397 |
+
+## 部署与回退
+- 现部署: `/opt/rocm/lib/libvkblas_hipblas.so` = **ae5d0958** (install 版, 内嵌 shader 路径 `/opt/rocm/lib/vkblas-shaders`)
+- repo 构建产物: `~/code/vkblas/libvkblas_hipblas.so` = c4f52303
+- 回退: `~/rocm-gfx803-archive/vkblas/libvkblas_hipblas.so.bak-47f07c4e` (上一版, 无显存修复)
+        或 `...bak-4298ef1a` (原始) → `sudo cp <bak> /opt/rocm-10.0.0/lib/libvkblas_hipblas.so`
+- 日常: `LD_PRELOAD=/opt/rocm-10.0.0/lib/libvkblas_hipblas.so` (无需其它环境变量)
+
+## 剩余
+- [x] OLD 对照臂 (用户已同意: 修法验证后再跑; 受控复现版; 预计崩/可能挂机)
+
+---
+
+# 【OLD 对照臂 — 证伪闭环】(10-08 09:32, 同夹具同日 A/B)
+
+配置: `~/code/probes/run_old_arm.sh` → 受控满容复现 (`vkblas_cache_overflow_repro.py`) × 旧 .so
+      `~/rocm-gfx803-archive/vkblas/libvkblas_hipblas.so.bak-4298ef1a`, VKBLAS_TRACE=1, 日志逐行 sync
+
+| | 旧 .so (4298ef1a) | 新 .so (ae5d0958) |
+|---|---|---|
+| 结果 | **rc=139 (SIGSEGV / core dump)** | DONE-CLEAN (本会话早先: 满容量插入 793 次) |
+| 崩点 | 紧接 `import cache MISS ... (n=256)`(缓存刚打满) + **连续 3 连导入**之后 | — |
+| 内核事件 | **+1: `GPU fault detected: 146 0x07e0480c`, `Process python pid 151373`, `VM_CONTEXT1_PROTECTION_FAULT_ADDR 0x001200FC`, `VM fault (0x0c, vmid 6, pasid 204) at page 1179900, read from 'TC4'`** | **0** |
+
+⇒ 与根因 #1 的预测触发条件 (满缓存 + 单操作 ≥3 连插入) 与历史签名族 (TC4 读, python 进程) **逐项吻合**;
+同日同夹具 A/B ⇒ **修复的因果性闭合** (旧版必崩, 新版零异常)。
+
+**机器处置**: 本次**未级联** —— 事后 `ring timeout = 0` / `GPU reset = 0`、桌面进程完好、
+轻量 GPU 复测 (64² matmul) 通过 ⇒ **无需硬重启** (与 10-07 两次级联挂机不同)。
+日志: `~/code/probes/runlogs/oldarm_20261008_093221.log`
+
+**全部上机门至此闭合**: 单测 → 烟测 → 受控满容复现 (新旧 A/B) → 全服务端 3 图 → 显存修复验证 → OLD 证伪。
+
