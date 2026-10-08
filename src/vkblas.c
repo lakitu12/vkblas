@@ -11,6 +11,12 @@
 #include <hip/hip_runtime_api.h>
 #include "ic_cache.h"   // import 缓存表核心 (host 单测: test/test_ic_cache.c)
 
+// stride uint32 截断防护: API 接受 int64_t stride, 但 shader push constant 是 uint32_t;
+// 超出 uint32 范围时回退逐 batch (stride=0 传 shader, host 侧指针算术仍用 int64_t)
+static inline int stride_fits_u32(int64_t s) {
+    return s >= 0 && s <= (int64_t)0xFFFFFFFFLL;
+}
+
 #ifndef VKBLAS_SHADER_DIR
 #define VKBLAS_SHADER_DIR "/home/lakitu/code/vkblas/src/shaders"
 #endif
@@ -925,6 +931,7 @@ static int transpose_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t n
                           uint32_t K, uint32_t N, uint32_t ldin, uint32_t* ldout,
                           uint32_t batch, int64_t stride_in, int64_t stride_out,
                           int submit) {
+    if (!stride_fits_u32(stride_in) || !stride_fits_u32(stride_out)) return -1;
     VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, need} };
     VkWriteDescriptorSet wds[2];
     for (int i = 0; i < 2; i++) {
@@ -1028,6 +1035,7 @@ static int transpose_h_into(VkBuffer bIn, size_t bytes_in, VkBuffer bOut, size_t
                             uint32_t* ldout, int dtype,
                             uint32_t batch, int64_t stride_in, int64_t stride_out,
                             int submit) {
+    if (!stride_fits_u32(stride_in) || !stride_fits_u32(stride_out)) return -1;
     VkDescriptorBufferInfo db[2] = { {bIn, 0, bytes_in}, {bOut, 0, need} };
     VkWriteDescriptorSet wds[2];
     for (int i = 0; i < 2; i++) {
@@ -1263,6 +1271,9 @@ static vkblas_status_t gemm_h_direct_merged(int dtype, int hip_physical, vkblas_
                                             float beta,
                                             void* C, uint32_t ldc,
                                             uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    // stride 截断防护: shader push constant 是 uint32_t; 超范围 → 回退逐 batch
+    if (!stride_fits_u32(stride_a) || !stride_fits_u32(stride_b) || !stride_fits_u32(stride_c))
+        return VKBLAS_ERR_FALLBACK;
     uint32_t Ra = (op_a == VKBLAS_OP_T) ? K : M;
     uint32_t Ca = (op_a == VKBLAS_OP_T) ? M : K;
     size_t ba_e = (size_t)(Ra - 1) * lda + Ca;
@@ -2602,6 +2613,9 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
     // Import all three allocations once, then record transpose (if needed) and GEMM
     // into one command buffer. This is the batch analogue of the single-call
     // transpose+GEMM fusion and avoids the old duplicate imports in run_gemm().
+    // stride 截断防护: shader push constant 是 uint32_t; 超范围 → 回退逐 batch
+    if (!stride_fits_u32(stride_a) || !stride_fits_u32(stride_b) || !stride_fits_u32(stride_c))
+        return VKBLAS_ERR_FALLBACK;
     size_t ba_all = ba + (stride_a > 0 ? (size_t)stride_a * (batch - 1) * 4 : 0);
     size_t bb_all = bb + (stride_b > 0 ? (size_t)stride_b * (batch - 1) * 4 : 0);
     size_t bc_all = bc + (stride_c > 0 ? (size_t)stride_c * (batch - 1) * 4 : 0);
