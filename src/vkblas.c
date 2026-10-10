@@ -1226,6 +1226,14 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
     return 0;
 }
 
+// v9-prefer 128-tile GEMM submit (forward decl; defined after run_gemm_vk128v9)
+static int run_gemm128_best(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                            VkBuffer bC, size_t bc,
+                            uint32_t M, uint32_t N, uint32_t K,
+                            uint32_t lda, uint32_t ldb, uint32_t ldc,
+                            uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                            float alpha, float beta, int submit);
+
 // Record one transpose and one fp32 GEMM into the same command buffer.
 static int run_fused_f32_transpose_gemm(int use128, int variant,
                                         VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
@@ -1246,7 +1254,7 @@ static int run_fused_f32_transpose_gemm(int use128, int variant,
     cmd_barrier(bBt, bb_t);
     int rc;
     if (use128)
-        rc = run_gemm_vk128(variant ^ 1, bA, ba, bBt, bb_t, bC, bc,
+        rc = run_gemm128_best(variant ^ 1, bA, ba, bBt, bb_t, bC, bc,
                             M, N, K, lda, ldb_t, ldc, batch, stride_a,
                             (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
     else
@@ -1582,6 +1590,23 @@ static int run_gemm_vk128v9(int variant, VkBuffer bA, size_t ba, VkBuffer bB, si
     vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
     if (submit) cmd_end_submit("GEMM128v9 submit");
     return 0;
+}
+
+// v9-prefer 128-tile GEMM submit: v9 无冲突读 (默认), 回退 v7
+// 用于 transpose-fused / merged / cache 路径 (之前只走 v7, 缺 v9 优化)
+static int run_gemm128_best(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                            VkBuffer bC, size_t bc,
+                            uint32_t M, uint32_t N, uint32_t K,
+                            uint32_t lda, uint32_t ldb, uint32_t ldc,
+                            uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                            float alpha, float beta, int submit) {
+    if (g.pipe128v9[variant] != VK_NULL_HANDLE)
+        return run_gemm_vk128v9(variant, bA, ba, bB, bb, bC, bc,
+                               M, N, K, lda, ldb, ldc, batch,
+                               stride_a, stride_b, stride_c, alpha, beta, submit);
+    return run_gemm_vk128(variant, bA, ba, bB, bb, bC, bc,
+                          M, N, K, lda, ldb, ldc, batch,
+                          stride_a, stride_b, stride_c, alpha, beta, submit);
 }
 
 // split-k GEMM 提交 (llama.cpp 借鉴): K 切 split_k 段并行 (dispatch x = Mt×split_k),
@@ -2657,7 +2682,7 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
             uint64_t pt1 = profile ? now_us() : 0;
 
             if (use128)
-                rc = run_gemm_vk128(variant ^ 1, bA, ba_all, bBt, bb_t, bC, bc_all,
+                rc = run_gemm128_best(variant ^ 1, bA, ba_all, bBt, bb_t, bC, bc_all,
                                     M, N, K, lda, ldb_t, ldc, batch, stride_a,
                                     (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
             else
@@ -2810,7 +2835,7 @@ vkblas_status_t vkblas_gemm_f32(
                 if (tc_get((const void*)pb, N, K, ldb, 1, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
                     // 用缓存转置直接跑 GEMM (TB=1, ldb_t=N 紧密)
                     if (use128)
-                        frc = run_gemm_vk128(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
+                        frc = run_gemm128_best(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
                                              M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
                     else
                         frc = run_gemm_vk(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
@@ -2858,7 +2883,7 @@ vkblas_status_t vkblas_gemm_f32(
                         if (import_ptr(pc, bc, &bC3, &mC3, &oC3) == 0) {
                             (void)oA3; (void)oC3;
                             if (use128)
-                                okt = run_gemm_vk128(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
+                                okt = run_gemm128_best(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
                                                      M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1) == 0;
                             else
                                 okt = run_gemm_vk(variant ^ 1, bA3, ba, bBt, bt_sz, bC3, bc,
