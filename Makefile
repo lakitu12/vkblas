@@ -39,6 +39,10 @@ SHADERS = $(SHADER_DIR)/gemm_f32_64x64_nn.spv $(SHADER_DIR)/gemm_f32_64x64_tn.sp
           $(SHADER_DIR)/gemm_f16_128x128_bankfree_nt.spv $(SHADER_DIR)/gemm_f16_128x128_bankfree_tt.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_bankfree_nn.spv $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tn.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_bankfree_nt.spv $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tt.spv \
+          $(SHADER_DIR)/gemm_f16_128x256_bankfree_nn.spv $(SHADER_DIR)/gemm_f16_128x256_bankfree_nt.spv \
+          $(SHADER_DIR)/gemm_f16_128x256_bankfree_tn.spv $(SHADER_DIR)/gemm_f16_128x256_bankfree_tt.spv \
+          $(SHADER_DIR)/gemm_bf16_128x256_bankfree_nn.spv $(SHADER_DIR)/gemm_bf16_128x256_bankfree_nt.spv \
+          $(SHADER_DIR)/gemm_bf16_128x256_bankfree_tn.spv $(SHADER_DIR)/gemm_bf16_128x256_bankfree_tt.spv \
           $(SHADER_DIR)/gemm_f16_128x128_splitk_nn.spv $(SHADER_DIR)/gemm_f16_128x128_splitk_nt.spv \
           $(SHADER_DIR)/gemm_f16_128x128_splitk_tn.spv $(SHADER_DIR)/gemm_f16_128x128_splitk_tt.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_splitk_nn.spv $(SHADER_DIR)/gemm_bf16_128x128_splitk_nt.spv \
@@ -232,6 +236,23 @@ $(SHADER_DIR)/gemm_bf16_128x128_bankfree_nt.spv: $(SHADER_DIR)/gemm_half_128x128
 $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tn.spv: $(SHADER_DIR)/gemm_half_128x128_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
 $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tt.spv: $(SHADER_DIR)/gemm_half_128x128_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
+# --- half 128x256 bankfree 高 acc 密度实验变体 (每线程 8x16=128 acc; VKBLAS_HT256 实验门) ---
+$(SHADER_DIR)/gemm_f16_128x256_bankfree_nn.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x256_bankfree_nt.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x256_bankfree_tn.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x256_bankfree_tt.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x256_bankfree_nn.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x256_bankfree_nt.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x256_bankfree_tn.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x256_bankfree_tt.spv: $(SHADER_DIR)/gemm_half_128x256_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/gemm_f16_128x128_splitk_nn.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@

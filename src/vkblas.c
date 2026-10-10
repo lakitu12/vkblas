@@ -66,6 +66,8 @@ VkPipeline mpipe[8];  // matvec: [0]=TB0 [1]=TB1 (M==1 单 pass), [2]=TB0 sk [3]
     VkPipeline pipe128x64[4]; // 128×64 tile (实验保留, 默认不选)
     VkPipeline pipe128v9[4]; // v9: 128×128 + 无冲突读 (64 acc) — fp32 128-tile 路径默认
     VkPipeline pipe128v9h[2][4]; // v9h: 2B 直通 + v9 无冲突读 — f16/bf16 128-tile 路径默认
+    VkPipeline pipe128x256h[2][4]; // 128x256 高 acc 密度实验变体 (每线程 8x16=128 acc; VKBLAS_HT256 实验门)
+    int pipe256_tried[2][4];     // 懒创建记录 (0=未试 1=已试; RADV 同批多建段错误 — 规避: 只用时才建)
     VkPipeline pipe128v9hp[4]; // v9hp: 2B 打包 LDS 主循环 (bf16, 破 LDS 带宽墙) — bf16 128-tile 首选
     VkPipeline pipe128v10h[2][4]; // 128×128 2B 真打包 LDS 直通 (实验保留, 默认不选)
     // f16/bf16 直通 GEMM (llama.cpp mul_mm 思路: 2B 半精度直进 LDS, 无 cvt 中间 buffer)
@@ -1253,6 +1255,61 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
     return 0;
 }
 
+// 128x256 变体懒创建 (RADV 对同批 >6 个该尺寸 pipeline 的创建会段错误 — 规避: 首次真实请求时才建;
+// 单次 <=6 个可正常创建, 已验证 (见 BACKLOG)。spv 缺失/创建失败 → -1, 调用方回退 128-tile)
+static int ensure_pipe256(int dtype, int variant) {
+    if (g.pipe128x256h[dtype][variant] != VK_NULL_HANDLE) return 0;
+    if (g.pipe256_tried[dtype][variant]) return -1;
+    g.pipe256_tried[dtype][variant] = 1;
+    static const char* names[2][4] = {
+        { "gemm_f16_128x256_bankfree_nn.spv", "gemm_f16_128x256_bankfree_nt.spv", "gemm_f16_128x256_bankfree_tn.spv", "gemm_f16_128x256_bankfree_tt.spv" },
+        { "gemm_bf16_128x256_bankfree_nn.spv", "gemm_bf16_128x256_bankfree_nt.spv", "gemm_bf16_128x256_bankfree_tn.spv", "gemm_bf16_128x256_bankfree_tt.spv" } };
+    VkShaderModule sm;
+    if (load_spv(names[dtype][variant], &sm) != 0) return -1;
+    VkComputePipelineCreateInfo hp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+                   VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
+        .layout = g.pl };
+    VkResult r = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128x256h[dtype][variant]);
+    vkDestroyShaderModule(g.dev, sm, NULL);
+    if (r != VK_SUCCESS) { g.pipe128x256h[dtype][variant] = VK_NULL_HANDLE; return -1; }
+    return 0;
+}
+
+// 128x256 高 acc 密度实验变体提交 (run_gemm_h128 同构; Nt = ceil(N/256); 仅供 VKBLAS_HT256 实验门)
+// 每线程 8x16=128 acc; 主循环 FMA:LDS = 128:12 ≈ 10.7; 描述符/push constant 约定同 128 版
+static int run_gemm_h256(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+                         VkBuffer bC, size_t bc,
+                         uint32_t M, uint32_t N, uint32_t K,
+                         uint32_t lda, uint32_t ldb, uint32_t ldc,
+                         uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                         float alpha, float beta, int submit) {
+    if (ensure_pipe256(dtype, variant) != 0) return -1;
+    VkPipeline pipe = g.pipe128x256h[dtype][variant];
+    VkDescriptorBufferInfo db[3] = {
+        {bA, 0, ba}, {bB, 0, bb}, {bC, 0, bc} };
+    VkWriteDescriptorSet wds[3];
+    for (int i = 0; i < 3; i++) {
+        wds[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = g.dset, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &db[i] };
+    }
+    vkUpdateDescriptorSets(g.dev, 3, wds, 0, NULL);
+
+    struct { uint32_t M, N, K, Mt, Nt, Kt, lda, ldb, ldc;
+             uint32_t batch_stride_a, batch_stride_b, batch_stride_c; float alpha, beta; } pc = {
+        M, N, K, (M + 127) / 128, (N + 255) / 256, (K + 15) / 16, lda, ldb, ldc,
+        (uint32_t)stride_a, (uint32_t)stride_b, (uint32_t)stride_c, alpha, beta };
+
+    if (submit) cmd_begin();
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.dset, 0, NULL);
+    vkCmdPushConstants(g.cmd, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(g.cmd, pc.Mt * batch, pc.Nt, 1);
+    if (submit) cmd_end_submit("half GEMM256 submit");
+    return 0;
+}
+
 // Forward declarations: the fused helper is kept next to the half path, while
 // the fp32 record-only submitters are defined below.
 static int run_gemm_vk(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
@@ -1289,7 +1346,14 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
     size_t bb_t = (size_t)batch * N * ldb_t * 2;
     cmd_barrier(bBt, bb_t);
     int rc;
-    if (use128)
+    // VKBLAS_HT256=1 实验门: 256-tile 高 acc 密度变体 (st-even-huge K=40 类瓶颈实验路径;
+    // pipe 缺失自动回退 128-tile)
+    const char* ht256 = getenv("VKBLAS_HT256");
+    if (use128 && ht256 != NULL && ht256[0] == '1' && M >= 256 && N >= 256)
+        rc = run_gemm_h256(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
+                           M, N, K, lda, ldb_t, ldc, batch, stride_a,
+                           (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+    else if (use128)
         rc = run_gemm_h128(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
                            M, N, K, lda, ldb_t, ldc, batch, stride_a,
                            (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
