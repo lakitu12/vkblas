@@ -1332,9 +1332,10 @@ static int run_fused_f32_transpose_gemm(int use128, int variant,
     return 0;
 }
 
-// 记录一次 A 转置 + 一次 fp32 GEMM (op_b==T, op_a==N): nt → tt
-// A (M×K, lda) → (K×M) 紧密 → tt 读 (TA=1 合并); 修复 TA=0 散读 ~11ms 惩罚 (10-10 归因)
-static int run_fused_f32_atranspose_gemm(VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
+// 记录一次 A 转置 + 一次 fp32 GEMM: 转置后 variant = variant | 2 (TA 位置 1, A 合并读)
+//   variant=1 (nt): TN 修复 → tt (TA=0 散读 ~11ms 惩罚, 10-10 归因)
+//   variant=0 (nn): NN 修复 → tn (仅转 A, 免 B 转置; 10-10 直连实验 tn 34.8 < B_T+tt 39.2)
+static int run_fused_f32_atranspose_gemm(int variant, VkBuffer bA, size_t ba, VkBuffer bB, size_t bb,
                                          VkBuffer bC, size_t bc,
                                          uint32_t M, uint32_t N, uint32_t K,
                                          uint32_t lda, uint32_t ldb, uint32_t ldc,
@@ -1348,13 +1349,13 @@ static int run_fused_f32_atranspose_gemm(VkBuffer bA, size_t ba, VkBuffer bB, si
     }
     size_t ba_t = (size_t)K * lda_t * 4;
     cmd_barrier(bAt, ba_t);
-    int rc = run_gemm128_best(3, bAt, ba_t, bB, bb, bC, bc,
+    int rc = run_gemm128_best(variant | 2, bAt, ba_t, bB, bb, bC, bc,
                               M, N, K, lda_t, ldb, ldc, 1, 0, 0, 0, alpha, beta, 0);
     if (rc != 0) {
         vkEndCommandBuffer(g.cmd);
         return rc;
     }
-    cmd_end_submit("fused fp32 A-transpose+GEMM (tt)");
+    cmd_end_submit("fused fp32 A-transpose+GEMM");
     return 0;
 }
 
@@ -2758,7 +2759,7 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
     int profile = getenv("VKBLAS_PROFILE") != NULL;
     uint64_t pt0 = profile ? now_us() : 0;
     if (op_b == VKBLAS_OP_N && g.tpipe != VK_NULL_HANDLE) {
-        // TA=0 (variant bit1=0, op_a=N): 转置 A → TA=1; 双转置后 variant=3 (tt)
+        // TA=0 (variant bit1=0, op_a=N): 转置 A → TA=1 (tn/tt 均需 A 合并读)
         int need_at = (variant & 2) == 0;
         VkBuffer bAt = VK_NULL_HANDLE;
         uint32_t lda_t = lda;
@@ -2771,32 +2772,40 @@ static int gemm_f32_merged(int variant, vkblas_op_t op_b,
                 cmd_barrier(bAt, ba_t);
             }
         }
-        VkBuffer bBt = VK_NULL_HANDLE;
-        uint32_t ldb_t = ldb;
-        if (rc == 0 && transpose_vk(bB, bb_all, K, N, ldb, &bBt, &ldb_t,
-                         batch, stride_b, (int64_t)N * K, 0) != 0) {
-            rc = VKBLAS_ERR_FALLBACK;
-        } else if (rc == 0) {
-            size_t bb_t = (size_t)batch * N * ldb_t * 4;
-            cmd_barrier(bBt, bb_t);
-            if (profile)
-                fprintf(stderr, "[vkblas] prof: transpose rec took %.3fms\n", (now_us() - pt0) / 1e3);
-            uint64_t pt1 = profile ? now_us() : 0;
-
-            int gemm_variant = need_at ? 3 : (variant ^ 1);
+        if (rc == 0) {
             VkBuffer bA_use = need_at ? bAt : bA;
             size_t ba_use = need_at ? (size_t)batch * K * lda_t * 4 : ba_all;
             uint32_t lda_use = need_at ? lda_t : lda;
-            if (use128)
-                rc = run_gemm128_best(gemm_variant, bA_use, ba_use, bBt, bb_t, bC, bc_all,
-                                    M, N, K, lda_use, ldb_t, ldc, batch,
-                                    need_at ? (int64_t)K * lda_t : stride_a,
-                                    (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
-            else
-                rc = run_gemm_vk(gemm_variant, bA_use, ba_use, bBt, bb_t, bC, bc_all,
-                                 M, N, K, lda_use, ldb_t, ldc, batch,
-                                 need_at ? (int64_t)K * lda_t : stride_a,
-                                 (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+            int64_t sa_use = need_at ? (int64_t)K * lda_t : stride_a;
+            // 【10-10 直连实验】B 转置整体不必要: tn (TA=1,TB=0) 直连 34.8 < B_T+tt 39.2
+            //   (variant=2 → tn 直连; variant=0 → A 转置 + tn)
+            if (use128 && g.pipe128v9[2] != VK_NULL_HANDLE) {
+                rc = run_gemm128_best(variant | 2, bA_use, ba_use, bB, bb_all, bC, bc_all,
+                                      M, N, K, lda_use, ldb, ldc, batch,
+                                      sa_use, stride_b, stride_c, alpha, beta, 0);
+            } else {
+                // 回退: B 转置 → tt (v7/v6; v9 缺失或 use128=0)
+                VkBuffer bBt = VK_NULL_HANDLE;
+                uint32_t ldb_t = ldb;
+                if (transpose_vk(bB, bb_all, K, N, ldb, &bBt, &ldb_t,
+                                 batch, stride_b, (int64_t)N * K, 0) != 0) {
+                    rc = VKBLAS_ERR_FALLBACK;
+                } else {
+                    size_t bb_t = (size_t)batch * N * ldb_t * 4;
+                    cmd_barrier(bBt, bb_t);
+                    if (profile)
+                        fprintf(stderr, "[vkblas] prof: transpose rec took %.3fms\n", (now_us() - pt0) / 1e3);
+                    int gemm_variant = need_at ? 3 : (variant ^ 1);
+                    if (use128)
+                        rc = run_gemm128_best(gemm_variant, bA_use, ba_use, bBt, bb_t, bC, bc_all,
+                                            M, N, K, lda_use, ldb_t, ldc, batch,
+                                            sa_use, (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+                    else
+                        rc = run_gemm_vk(gemm_variant, bA_use, ba_use, bBt, bb_t, bC, bc_all,
+                                         M, N, K, lda_use, ldb_t, ldc, batch,
+                                         sa_use, (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
+                }
+            }
         }
     } else {
         rc = run_gemm_vk(variant, bA, ba_all, bB, bb_all, bC, bc_all,
@@ -2936,27 +2945,41 @@ vkblas_status_t vkblas_gemm_f32(
                 pthread_mutex_unlock(&g.lock);
                 return VKBLAS_ERR_IMPORT;
             }
-            int frc;
-            // VKBLAS_CACHE_TRANSPOSE: B (K×N,ldb) → (N×K) 紧密缓存 (推理权重不变)
-            if (batch == 1 && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
-                VkBuffer bBt; size_t bt_sz; int tbuilt;
-                if (tc_get((const void*)pb, N, K, ldb, 1, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
-                    // 用缓存转置直接跑 GEMM (TB=1, ldb_t=N 紧密)
-                    if (use128)
-                        frc = run_gemm128_best(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
-                                             M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
-                    else
-                        frc = run_gemm_vk(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
-                                          M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
+            int frc = -1;
+            // 【10-10 直连实验】tn (TA=1,TB=0) 直连 34.8ms, 优于一切转置方案:
+            //   NT (variant=2): tn 直连 (免 B 转置; 39.2 → 34.8)
+            //   NN (variant=0): A 转置 → tn (免 B 转置; 43.3 → ~38.6)
+            if (use128 && batch == 1 && g.pipe128v9[2] != VK_NULL_HANDLE) {
+                if (variant == 2)
+                    frc = run_gemm128_best(2, bA2, ba, bB2, bb, bC2, bc,
+                                           M, N, K, lda, ldb, ldc, 1, 0, 0, 0, alpha, beta, 1);
+                else
+                    frc = run_fused_f32_atranspose_gemm(0, bA2, ba, bB2, bb, bC2, bc,
+                                                        M, N, K, lda, ldb, ldc, alpha, beta);
+            }
+            if (frc != 0) {
+                // 回退: 原逻辑 (tc 缓存 / 转置 B+tt); v9 缺失 / use128=0 / batch>1 走此路
+                // VKBLAS_CACHE_TRANSPOSE: B (K×N,ldb) → (N×K) 紧密缓存 (推理权重不变)
+                if (batch == 1 && getenv("VKBLAS_CACHE_TRANSPOSE") != NULL) {
+                    VkBuffer bBt; size_t bt_sz; int tbuilt;
+                    if (tc_get((const void*)pb, N, K, ldb, 1, 4, &bBt, &bt_sz, &tbuilt, 0) == 0) {
+                        // 用缓存转置直接跑 GEMM (TB=1, ldb_t=N 紧密)
+                        if (use128)
+                            frc = run_gemm128_best(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
+                                                 M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
+                        else
+                            frc = run_gemm_vk(variant ^ 1, bA2, ba, bBt, bt_sz, bC2, bc,
+                                              M, N, K, lda, N, ldc, 1, 0, 0, 0, alpha, beta, 1);
+                    } else {
+                        frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
+                                                           bC2, bc, M, N, K, lda, ldb, ldc,
+                                                           1, 0, 0, 0, alpha, beta);
+                    }
                 } else {
                     frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
                                                        bC2, bc, M, N, K, lda, ldb, ldc,
                                                        1, 0, 0, 0, alpha, beta);
                 }
-            } else {
-                frc = run_fused_f32_transpose_gemm(use128, variant, bA2, ba, bB2, bb,
-                                                   bC2, bc, M, N, K, lda, ldb, ldc,
-                                                   1, 0, 0, 0, alpha, beta);
             }
             release_ptr(mA2, bA2); release_ptr(mB2, bB2); release_ptr(mC2, bC2);
             if (frc != 0) {
@@ -3014,7 +3037,7 @@ vkblas_status_t vkblas_gemm_f32(
                         if (import_ptr(pb, bb, &bB4, &mB4, &oB4) == 0) {
                             if (import_ptr(pc, bc, &bC4, &mC4, &oC4) == 0) {
                                 (void)oA4; (void)oB4; (void)oC4;
-                                atrc = run_fused_f32_atranspose_gemm(bA4, ba, bB4, bb, bC4, bc,
+                                atrc = run_fused_f32_atranspose_gemm(1, bA4, ba, bB4, bb, bC4, bc,
                                                                      M, N, K, lda, ldb, ldc, alpha, beta);
                                 release_ptr(mC4, bC4);
                             }
