@@ -1518,6 +1518,12 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
         uint32_t nbcap = 1024 / tiles;
         if (nbcap < 1) nbcap = 1;
         if (nbcap > 16) nbcap = 16;
+        // 调参口: VKBLAS_MERGE_NBMAX=N 限每批 batch 上限 (默认上式; nb 扫描探针用)
+        const char* nmax = getenv("VKBLAS_MERGE_NBMAX");
+        if (nmax && *nmax) {
+            uint32_t cap = (uint32_t)strtoul(nmax, NULL, 10);
+            if (cap >= 1 && cap < nbcap) nbcap = cap;
+        }
         while (rem > 0) {
             uint32_t nb = rem > nbcap ? nbcap : rem;
             rc = gemm_h_direct_merged(dtype, hip_physical, op_a, op_b, M, N, K,
@@ -1561,6 +1567,12 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
                 uint32_t split_k = 144 / (Mt_h * Nt_h) + 1;
                 if (split_k < 2) split_k = 2;
                 if (split_k > 8) split_k = 8;
+                // 调参口: VKBLAS_HSPLITK_MAX=N 限 split 上限 (默认 8=不限; split 扫描探针用)
+                const char* smax = getenv("VKBLAS_HSPLITK_MAX");
+                if (smax && *smax) {
+                    uint32_t cap = (uint32_t)strtoul(smax, NULL, 10);
+                    if (cap >= 1 && cap < split_k) split_k = cap;
+                }
                 while (split_k > 1 && (K + split_k - 1) / split_k < 16) split_k--;
                 if (split_k > 1) {
                     rc = run_gemm_hsk(dtype, variant, bA, ba_e * 2, bB, bb_e * 2, bC, bc_e * 2,
