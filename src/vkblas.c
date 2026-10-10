@@ -1273,6 +1273,8 @@ static int ensure_pipe256(int dtype, int variant) {
     VkResult r = vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &hp, NULL, &g.pipe128x256h[dtype][variant]);
     vkDestroyShaderModule(g.dev, sm, NULL);
     if (r != VK_SUCCESS) { g.pipe128x256h[dtype][variant] = VK_NULL_HANDLE; return -1; }
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vkblas] ensure_pipe256: created %s variant=%d\n", dtype ? "bf16" : "f16", variant);
     return 0;
 }
 
@@ -1335,6 +1337,9 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
                                          uint32_t lda, uint32_t ldb, uint32_t ldc,
                                          uint32_t batch, int64_t stride_a, int64_t stride_b,
                                          int64_t stride_c, float alpha, float beta) {
+    if (getenv("VKBLAS_TRACE"))
+        fprintf(stderr, "[vk] fused half: variant=%d use128=%d M=%u N=%u K=%u lda=%u ldb=%u\n",
+                variant, use128, M, N, K, lda, ldb);
     VkBuffer bBt = VK_NULL_HANDLE;
     uint32_t ldb_t = ldb;
     cmd_begin();
