@@ -888,6 +888,11 @@ static int pick_tile128(uint32_t M, uint32_t N) {
     }
     if (M < 256 || N < 256) return 0;
     uint32_t Mt = (M + 127) / 128, Nt = (N + 127) / 128;
+    // 10-10: 128-tile WG 过少 (Mt*Nt<64) 切 64-tile (WG×4, 64-tile v6h 主循环效率低但并行度补回):
+    //   ex-mid1 (40WG) 1.01→0.95 (-6%), ex-154 (20WG) -10%, ex-128 (10WG) -16%;
+    //   ex-mid2 (80WG, 不切) 保住 128-tile 最优; ex-big (≥320WG) 不影响;
+    //   fp32 4096³ 四组合无回归 (Mt*Nt=1024 远超阈值)。
+    if (Mt * Nt < 64) return 0;
     return 1;
 }
 
