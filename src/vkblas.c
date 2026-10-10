@@ -281,7 +281,7 @@ static void init_vkblas(void) {
         .setLayoutCount = 1, .pSetLayouts = &g.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     vk_check(vkCreatePipelineLayout(g.dev, &plci, NULL, &g.pl), "pipeline layout");
 
-    static const char* names[4] = { "gemm_nn.spv", "gemm_nt.spv", "gemm_tn.spv", "gemm_tt.spv" };
+    static const char* names[4] = { "gemm_f32_64x64_nn.spv", "gemm_f32_64x64_nt.spv", "gemm_f32_64x64_tn.spv", "gemm_f32_64x64_tt.spv" };
     VkShaderModule sm;
     for (int i = 0; i < 4; i++) {
         if (load_spv(names[i], &sm) != 0) { g.init_done = 1; return; }
@@ -293,9 +293,9 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // matvec (M==1 decode): 免 B 转置; [0]=B(K×N) 直读, [1]=B(N×K) 列读, [2/3]=split-k 版
-    static const char* mnames[8] = { "matvec_n.spv", "matvec_t.spv",
-                                     "matvec_sk_n.spv", "matvec_sk_t.spv",
-                                     "matvec_sk_h16.spv", "matvec_sk_bf16.spv",
+    static const char* mnames[8] = { "matvec_f32_n.spv", "matvec_f32_t.spv",
+                                     "matvec_f32_splitk_n.spv", "matvec_f32_splitk_t.spv",
+                                     "matvec_f16_splitk.spv", "matvec_bf16_splitk.spv",
                                      NULL, NULL };
     for (int i = 0; i < 8; i++) {
         g.mpipe[i] = VK_NULL_HANDLE;
@@ -309,7 +309,7 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // v7-128 tile (实验性, 缺 shader 则不可用; VKBLAS_TILE128=1 时 fp32 GEMM 走此路径)
-    static const char* names128[4] = { "gemm128_nn.spv", "gemm128_nt.spv", "gemm128_tn.spv", "gemm128_tt.spv" };
+    static const char* names128[4] = { "gemm_f32_128x128_bankconflict_nn.spv", "gemm_f32_128x128_bankconflict_nt.spv", "gemm_f32_128x128_bankconflict_tn.spv", "gemm_f32_128x128_bankconflict_tt.spv" };
     for (int i = 0; i < 4; i++) {
         g.pipe128[i] = VK_NULL_HANDLE;
         if (load_spv(names128[i], &sm) != 0) continue;
@@ -321,7 +321,7 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // 128×64 tile (实验保留, 默认不选)
-    static const char* names128x64[4] = { "gemm128x64_nn.spv", "gemm128x64_nt.spv", "gemm128x64_tn.spv", "gemm128x64_tt.spv" };
+    static const char* names128x64[4] = { "gemm_f32_128x64_nn.spv", "gemm_f32_128x64_nt.spv", "gemm_f32_128x64_tn.spv", "gemm_f32_128x64_tt.spv" };
     for (int i = 0; i < 4; i++) {
         g.pipe128x64[i] = VK_NULL_HANDLE;
         if (load_spv(names128x64[i], &sm) != 0) continue;
@@ -333,7 +333,7 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // v9 128×128 tile (64 acc + 无冲突 LDS 读; fp32 128-tile 路径默认)
-    static const char* names128v9[4] = { "gemm128v9_nn.spv", "gemm128v9_nt.spv", "gemm128v9_tn.spv", "gemm128v9_tt.spv" };
+    static const char* names128v9[4] = { "gemm_f32_128x128_bankfree_nn.spv", "gemm_f32_128x128_bankfree_nt.spv", "gemm_f32_128x128_bankfree_tn.spv", "gemm_f32_128x128_bankfree_tt.spv" };
     for (int i = 0; i < 4; i++) {
         g.pipe128v9[i] = VK_NULL_HANDLE;
         if (load_spv(names128v9[i], &sm) != 0) continue;
@@ -346,8 +346,8 @@ static void init_vkblas(void) {
     }
     // v9h 2B 直通 (v7h load/写 C + v9 无冲突主循环; f16/bf16 128-tile 路径默认)
     static const char* h128v9hnames[2][4] = {
-        { "gemm128v9h_h16_nn.spv", "gemm128v9h_h16_nt.spv", "gemm128v9h_h16_tn.spv", "gemm128v9h_h16_tt.spv" },
-        { "gemm128v9h_b16_nn.spv", "gemm128v9h_b16_nt.spv", "gemm128v9h_b16_tn.spv", "gemm128v9h_b16_tt.spv" } };
+        { "gemm_f16_128x128_bankfree_nn.spv", "gemm_f16_128x128_bankfree_nt.spv", "gemm_f16_128x128_bankfree_tn.spv", "gemm_f16_128x128_bankfree_tt.spv" },
+        { "gemm_bf16_128x128_bankfree_nn.spv", "gemm_bf16_128x128_bankfree_nt.spv", "gemm_bf16_128x128_bankfree_tn.spv", "gemm_bf16_128x128_bankfree_tt.spv" } };
     for (int d = 0; d < 2; d++) {
         for (int i = 0; i < 4; i++) {
             g.pipe128v9h[d][i] = VK_NULL_HANDLE;
@@ -362,8 +362,8 @@ static void init_vkblas(void) {
     }
 
     // v9hp 2B 打包 LDS (bf16 首选: 主循环 LDS 流量减半; 缺 shader 回退 v9h)
-    static const char* hp128names[4] = { "gemm128v9hp_b16_nn.spv", "gemm128v9hp_b16_nt.spv",
-                                         "gemm128v9hp_b16_tn.spv", "gemm128v9hp_b16_tt.spv" };
+    static const char* hp128names[4] = { "gemm_bf16_128x128_lds_packed_b64_nn.spv", "gemm_bf16_128x128_lds_packed_b64_nt.spv",
+                                         "gemm_bf16_128x128_lds_packed_b64_tn.spv", "gemm_bf16_128x128_lds_packed_b64_tt.spv" };
     for (int i = 0; i < 4; i++) {
         g.pipe128v9hp[i] = VK_NULL_HANDLE;
         if (load_spv(hp128names[i], &sm) != 0) continue;
@@ -395,7 +395,7 @@ static void init_vkblas(void) {
     VkPipelineLayoutCreateInfo tplci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &g.tdsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &tpcr };
     vk_check(vkCreatePipelineLayout(g.dev, &tplci, NULL, &g.tpl), "t pl");
-    if (load_spv("transpose.spv", &sm) == 0) {
+    if (load_spv("transpose_f32.spv", &sm) == 0) {
         VkComputePipelineCreateInfo tcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
                        VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
@@ -436,18 +436,18 @@ static void init_vkblas(void) {
     // ---- f16/bf16 直通 GEMM pipeline (复用 g.dsl/g.pl: 3 storage + 44B push) ----
     // dtype: 0 = fp16 (h16), 1 = bf16 (b16); 缺 shader 则对应 dtype 回退旧 cvt 管道
     static const char* hnames[2][4] = {
-        { "gemm_h16_nn.spv", "gemm_h16_nt.spv", "gemm_h16_tn.spv", "gemm_h16_tt.spv" },
-        { "gemm_b16_nn.spv", "gemm_b16_nt.spv", "gemm_b16_tn.spv", "gemm_b16_tt.spv" } };
+        { "gemm_f16_64x64_nn.spv", "gemm_f16_64x64_nt.spv", "gemm_f16_64x64_tn.spv", "gemm_f16_64x64_tt.spv" },
+        { "gemm_bf16_64x64_nn.spv", "gemm_bf16_64x64_nt.spv", "gemm_bf16_64x64_tn.spv", "gemm_bf16_64x64_tt.spv" } };
     static const char* h128names[2][4] = {
-        { "gemm128_h16_nn.spv", "gemm128_h16_nt.spv", "gemm128_h16_tn.spv", "gemm128_h16_tt.spv" },
-        { "gemm128_b16_nn.spv", "gemm128_b16_nt.spv", "gemm128_b16_tn.spv", "gemm128_b16_tt.spv" } };
+        { "gemm_f16_128x128_bankconflict_nn.spv", "gemm_f16_128x128_bankconflict_nt.spv", "gemm_f16_128x128_bankconflict_tn.spv", "gemm_f16_128x128_bankconflict_tt.spv" },
+        { "gemm_bf16_128x128_bankconflict_nn.spv", "gemm_bf16_128x128_bankconflict_nt.spv", "gemm_bf16_128x128_bankconflict_tn.spv", "gemm_bf16_128x128_bankconflict_tt.spv" } };
     static const char* h128x64names[2][4] = {
-        { "gemm128x64_h16_nn.spv", "gemm128x64_h16_nt.spv", "gemm128x64_h16_tn.spv", "gemm128x64_h16_tt.spv" },
-        { "gemm128x64_b16_nn.spv", "gemm128x64_b16_nt.spv", "gemm128x64_b16_tn.spv", "gemm128x64_b16_tt.spv" } };
+        { "gemm_f16_128x64_nn.spv", "gemm_f16_128x64_nt.spv", "gemm_f16_128x64_tn.spv", "gemm_f16_128x64_tt.spv" },
+        { "gemm_bf16_128x64_nn.spv", "gemm_bf16_128x64_nt.spv", "gemm_bf16_128x64_tn.spv", "gemm_bf16_128x64_tt.spv" } };
     static const char* h128v10hnames[2][4] = {
-        { "gemm128v10h_h16_nn.spv", "gemm128v10h_h16_nt.spv", "gemm128v10h_h16_tn.spv", "gemm128v10h_h16_tt.spv" },
-        { "gemm128v10h_b16_nn.spv", "gemm128v10h_b16_nt.spv", "gemm128v10h_b16_tn.spv", "gemm128v10h_b16_tt.spv" } };
-    static const char* htnames[2] = { "transpose_h16.spv", "transpose_b16.spv" };
+        { "gemm_f16_128x128_lds_packed_b128_nn.spv", "gemm_f16_128x128_lds_packed_b128_nt.spv", "gemm_f16_128x128_lds_packed_b128_tn.spv", "gemm_f16_128x128_lds_packed_b128_tt.spv" },
+        { "gemm_bf16_128x128_lds_packed_b128_nn.spv", "gemm_bf16_128x128_lds_packed_b128_nt.spv", "gemm_bf16_128x128_lds_packed_b128_tn.spv", "gemm_bf16_128x128_lds_packed_b128_tt.spv" } };
+    static const char* htnames[2] = { "transpose_f16.spv", "transpose_bf16.spv" };
     for (int d = 0; d < 2; d++) {
         for (int i = 0; i < 4; i++) {
             g.pipe_h[d][i] = VK_NULL_HANDLE;
@@ -499,8 +499,8 @@ static void init_vkblas(void) {
     }
 
     // ---- split-k (llama.cpp 借鉴: K 分段并行 + reduce; 仅 fp32, 复用 g.dsl/g.pl) ----
-    static const char* sknames[4] = { "gemm_sk_nn.spv", "gemm_sk_nt.spv", "gemm_sk_tn.spv", "gemm_sk_tt.spv" };
-    static const char* sk128names[4] = { "gemm_sk128_nn.spv", "gemm_sk128_nt.spv", "gemm_sk128_tn.spv", "gemm_sk128_tt.spv" };
+    static const char* sknames[4] = { "gemm_f32_64x64_splitk_nn.spv", "gemm_f32_64x64_splitk_nt.spv", "gemm_f32_64x64_splitk_tn.spv", "gemm_f32_64x64_splitk_tt.spv" };
+    static const char* sk128names[4] = { "gemm_f32_128x128_splitk_nn.spv", "gemm_f32_128x128_splitk_nt.spv", "gemm_f32_128x128_splitk_tn.spv", "gemm_f32_128x128_splitk_tt.spv" };
     for (int i = 0; i < 4; i++) {
         g.pipe_sk[i] = VK_NULL_HANDLE;
         g.pipe_sk128[i] = VK_NULL_HANDLE;
@@ -522,7 +522,7 @@ static void init_vkblas(void) {
         }
     }
     g.sk_reduce_pipe = VK_NULL_HANDLE;
-    static const char* rhnames[2] = { "split_k_reduce_h16.spv", "split_k_reduce_bf16.spv" };
+    static const char* rhnames[2] = { "splitk_reduce_f16.spv", "splitk_reduce_bf16.spv" };
     for (int d = 0; d < 2; d++) {
         g.rhpipe[d] = VK_NULL_HANDLE;
         if (load_spv(rhnames[d], &sm) != 0) continue;
@@ -534,8 +534,8 @@ static void init_vkblas(void) {
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
     // M 行 matvec split-k (decode m=2..64, op_b==T 缓存 Bt): [0]=fp16, [1]=bf16
-    static const char* mmnames[2] = { "matvec_sk_m_h16.spv", "matvec_sk_m_bf16.spv" };
-    static const char* rmnames[2] = { "split_k_reduce_m_h16.spv", "split_k_reduce_m_bf16.spv" };
+    static const char* mmnames[2] = { "matvec_f16_splitk_m.spv", "matvec_bf16_splitk_m.spv" };
+    static const char* rmnames[2] = { "splitk_reduce_m_f16.spv", "splitk_reduce_m_bf16.spv" };
     for (int d = 0; d < 2; d++) {
         g.mpipe_m[d] = VK_NULL_HANDLE;
         g.rhpipe_m[d] = VK_NULL_HANDLE;
@@ -556,7 +556,7 @@ static void init_vkblas(void) {
             vkDestroyShaderModule(g.dev, sm, NULL);
         }
     }
-    if (load_spv("split_k_reduce.spv", &sm) == 0) {
+    if (load_spv("splitk_reduce_f32.spv", &sm) == 0) {
         VkComputePipelineCreateInfo rp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
                        VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
@@ -653,7 +653,7 @@ static void init_vkblas(void) {
         .setLayoutCount = 1, .pSetLayouts = &g.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &d64pcr };
     vk_check(vkCreatePipelineLayout(g.dev, &d64plci, NULL, &g.d64pl), "d64 pl");
     // 索引 = op_a*2+op_b → {nn, nt, tn, tt} (与 fp32 引擎一致!)
-    static const char* d64names[4] = { "gemm_d64_nn.spv", "gemm_d64_nt.spv", "gemm_d64_tn.spv", "gemm_d64_tt.spv" };
+    static const char* d64names[4] = { "gemm_f64_32x32_nn.spv", "gemm_f64_32x32_nt.spv", "gemm_f64_32x32_tn.spv", "gemm_f64_32x32_tt.spv" };
     for (int i = 0; i < 4; i++) {
         if (load_spv(d64names[i], &sm) != 0) continue;
         VkComputePipelineCreateInfo dcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -663,7 +663,7 @@ static void init_vkblas(void) {
         vk_check(vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &dcp, NULL, &g.d64pipe[i]), "d64 pipe");
         vkDestroyShaderModule(g.dev, sm, NULL);
     }
-    if (load_spv("transpose_d64.spv", &sm) == 0) {
+    if (load_spv("transpose_f64.spv", &sm) == 0) {
         VkComputePipelineCreateInfo dtcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
                        VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL },
@@ -1191,7 +1191,7 @@ static int run_gemm_h128(int dtype, int variant, VkBuffer bA, size_t ba, VkBuffe
                          uint32_t batch, int64_t stride_a, int64_t stride_b, int64_t stride_c,
                          float alpha, float beta, int submit) {
     // v9h 为默认 2B 直通变体 (v9 无冲突主循环); shader 缺失时回退 v7h
-    // (v9hp 打包变体: 加载保留作对照, 实测证伪不启用 — 见 gemm_tmpl_128_v9hp.comp 头注释)
+    // (v9hp 打包变体: 加载保留作对照, 实测证伪不启用 — 见 gemm_half_128x128_lds_packed_b64_tmpl.comp 头注释)
     VkPipeline pipe = g.pipe128v9h[dtype][variant] != VK_NULL_HANDLE
                         ? g.pipe128v9h[dtype][variant] : g.pipe128_h[dtype][variant];
     if (pipe == VK_NULL_HANDLE) return -1;
@@ -3104,7 +3104,7 @@ static vkblas_status_t gemm_bf16_core(int hip_physical,
     uint32_t Rb, Cb;
     int variant;
     if (op_b == VKBLAS_OP_N) {
-        // B 转置在 fp32 化后单独做 (transpose.comp 快路径, cvt_tsp 直接写太慢)
+        // B 转置在 fp32 化后单独做 (transpose_f32.comp 快路径, cvt_tsp 直接写太慢)
         Rb = K; Cb = N;
         bb_e = (size_t)(K - 1) * ldb + N;
         bb2  = bb_e * 4;                                  // 先按原布局 fp32 化
@@ -3210,7 +3210,7 @@ vkblas_status_t vkblas_gemm_bf16_hipblas(
 
 // fp16 GEMM 回退: A/B/C (fp16, 2B/元素) → 内部 fp32 → fp32 GEMM → 回写 fp16
 // 管道同 bf16 (cvt 索引 4/6/7), 位转换不同: unpackHalf2x16/packHalf2x16 (RNE)
-// op_b==N 时 cvt 后单独转置 (transpose.comp 快路径) 走 TB=1
+// op_b==N 时 cvt 后单独转置 (transpose_f32.comp 快路径) 走 TB=1
 vkblas_status_t vkblas_gemm_f16(
     vkblas_op_t op_a, vkblas_op_t op_b,
     uint32_t M, uint32_t N, uint32_t K,
@@ -3272,7 +3272,7 @@ vkblas_status_t vkblas_gemm_f16(
     uint32_t Rb, Cb;
     int variant;
     if (op_b == VKBLAS_OP_N) {
-        // B 转置在 fp32 化后单独做 (transpose.comp 快路径)
+        // B 转置在 fp32 化后单独做 (transpose_f32.comp 快路径)
         Rb = K; Cb = N;
         bb_e = (size_t)(K - 1) * ldb + N;
         bb2  = bb_e * 4;

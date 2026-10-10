@@ -1,5 +1,5 @@
 #version 450
-// GEMM f32 v6 + split-k: tile 64×64 (同 gemm_tmpl.comp), 但 K 切成多段并行
+// GEMM f32 64x64 splitk (原 v6 + split-k): tile 64×64 (同 gemm_f32_64x64_tmpl.comp), 但 K 切成多段并行
 // dispatch x = Mt × split_k; ik = wgx / Mt → 本 wg 负责 [ik*k_split, min(K, (ik+1)*k_split))
 // 输出纯部分和 (无 alpha/beta) → Sk[ik*M*N + m*N + n] (紧密), reduce 统一处理 alpha/beta
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;

@@ -63,7 +63,7 @@ static void init_vk(void) {
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
     check(vkCreatePipelineLayout(dev, &plci, NULL, &pl), "pl");
-    FILE* f = fopen("src/shaders/gemm_nn.spv", "rb");
+    FILE* f = fopen("src/shaders/gemm_f32_64x64_nn.spv", "rb");
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     uint32_t* code = malloc(sz); fread(code, 1, sz, f); fclose(f);
     VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,

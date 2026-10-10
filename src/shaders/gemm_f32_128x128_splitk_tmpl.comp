@@ -1,5 +1,5 @@
 #version 450
-// GEMM f32 v7-128 + split-k: tile 128×128 (同 gemm_tmpl_128.comp), K 分段并行
+// GEMM f32 128x128 splitk (原 v7-128 + split-k): tile 128×128 (同 gemm_f32_128x128_bankconflict_tmpl.comp), K 分段并行
 // dispatch x = Mt × split_k; ik = wgx / Mt; 输出纯部分和 → Sk[ik*M*N + m*N + n]
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer A_buf { float A[]; };

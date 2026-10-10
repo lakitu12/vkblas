@@ -1,5 +1,5 @@
 #version 450
-// GEMM 2B 真直通 v10h (实验性, VKBLAS_V10H=1 启用; 结论: 输给 v7h 假直通!)
+// GEMM 2B 真直通 128x128 lds_packed_b128 (原 v10h; 实验性, VKBLAS_V10H=1 启用; 结论: 输给 v7h 假直通!)
 // tile 128×128 (M×N), BK=16, 256 线程 (16×16), 每线程 8×8 = 64 acc
 // LDS 存打包 uint (每 uint 2 个 2B 值), 主循环解包后 FMA:
 //   - LDS 流量减半 (2KB/kk vs 4KB/kk), ds 条数减半

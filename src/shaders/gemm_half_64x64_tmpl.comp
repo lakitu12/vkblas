@@ -1,9 +1,9 @@
 #version 450
-// GEMM f16/bf16 v6h: tile 64×64 (同 v6: 每线程 4×4=16 acc, LDS 32×66+32×66)
+// GEMM f16/bf16 64x64 (原 v6h): tile 64×64 (同 v6: 每线程 4×4=16 acc, LDS 32×66+32×66)
 // A/B/C 为 2B 半精度位模式 (uint 数组); -D HALF_TYPE=1 (fp16) / 2 (bf16)
 // load 时转 fp32 存 LDS (内循环与 fp32 版一致, 零改动)
 // 写 C: pack 回 2B, 每 2 元素 1 uint; host 保证 ldc 偶且 N 偶 (无跨行共享 uint, 无读改写竞争)
-// 转置 B (TB=1 输入) 由 transpose_h.comp 完成, 行步长已 pad 偶
+// 转置 B (TB=1 输入) 由 transpose_half.comp 完成, 行步长已 pad 偶
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer A_buf { uint A[]; };
 layout(set = 0, binding = 1) buffer B_buf { uint B[]; };

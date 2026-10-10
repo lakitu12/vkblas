@@ -1,6 +1,6 @@
 #version 450
-// GEMM f16/bf16 v8h: tile 128×64 (M×N), BK=16, 256 线程, 每线程 8×4 = 32 acc
-// fp32 v8 的 2B 版本 (gemm128x64_tmpl.comp 结构):
+// GEMM f16/bf16 128x64 (原 v8h): tile 128×64 (M×N), BK=16, 256 线程, 每线程 8×4 = 32 acc
+// fp32 v8 的 2B 版本 (gemm_f32_128x64_tmpl.comp 结构):
 //   - 32 acc → ~60 VGPR → 4 wg/CU (v7h-128 98 VGPR 只有 2 wg → FMA 42%)
 //   - LDS 交错 vec2 读 (lx*2 + ii*32) → 无 bank 冲突
 // -D HALF_TYPE=1 (fp16) / 2 (bf16); load 转 fp32 存 LDS, 写 C pack 回 2B

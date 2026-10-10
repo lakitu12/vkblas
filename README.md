@@ -105,7 +105,7 @@ env -u PYTHONPATH -u PYTHONHOME \
 - 64-thread workgroups under-occupy gfx803 (6 waves/CU); 256-thread wgs with 3/CU
   is the sweet spot
 - write-C pattern: wave covers 16 rows × 256B — write bandwidth on gfx803 is
-  governed by the number of rows a wave touches (see `src/shaders/gemm_tmpl.comp`)
+  governed by the number of rows a wave touches (see `src/shaders/gemm_f32_64x64_tmpl.comp`)
 - transpose shader: vec4 reads + 4 scattered scalar writes + chunked dispatch
   (8 MB per dispatch; single dispatches ≥16384 workgroups collapse to 6 GB/s)
 
@@ -116,8 +116,8 @@ src/vkblas.c            Vulkan engine (init, dma-buf import, GEMM/transpose)
 src/vkblas_hipblas.c    hipBLAS ABI shim (LD_PRELOAD)
 src/vkblas.h            public API
 src/ic_cache.h          dma-buf import cache core (holds refcount + host unit test)
-src/shaders/gemm_tmpl.comp   GEMM shader template (TA/TB → 4 variants)
-src/shaders/transpose.comp   row-major → column-major transpose
+src/shaders/gemm_f32_64x64_tmpl.comp   GEMM shader template (TA/TB → 4 variants)
+src/shaders/transpose_f32.comp   row-major → column-major transpose
 test/test_gemm.c        C-level correctness (CPU reference)
 test/test_ic_cache.c    import-cache core host unit test (zero GPU)
 test/test_torch.py      PyTorch end-to-end + perf

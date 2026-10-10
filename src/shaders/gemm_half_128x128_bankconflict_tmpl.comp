@@ -1,9 +1,7 @@
 #version 450
-// GEMM f16/bf16 v9h-128: tile 128×128 (M×N), BK=16, 256 线程 (16×16), 每线程 8×8 = 64 acc
-// = v7h (gemm_tmpl_128_h.comp) 的 load/写 C + v9 的无冲突 LDS 主循环:
-//   vec2 (b64) 基步长 2 flt → lx*2 % 32 全唯一, 无 bank 冲突
-//   (fp32 v9 实测 3.84T ≈ 纯净上限 97%, v7 冲突读只有 ~3.0T)
-// A/B/C 为 2B 半精度位模式 (uint 数组); -D HALF_TYPE=1 (fp16) / 2 (bf16)
+// GEMM f16/bf16 128x128 bankconflict (原 v7h-128): tile 128×128 (M×N), BK=16, 256 线程 (16×16), 每线程 8×8 = 64 acc
+// 同 fp32 v7-128 (llama.cpp l_warptile 移植), 但 A/B/C 为 2B 半精度位模式 (uint 数组)
+// -D HALF_TYPE=1 (fp16) / 2 (bf16)
 // load 时转 fp32 存 LDS; 写 C pack 回 2B (每 2 元素 1 uint)
 // host 保证: ldc 偶 且 N 偶 → 无跨行共享 uint; 转置 B 行步长 pad 偶
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -22,7 +20,7 @@ layout(push_constant) uniform Params {
 shared float As[16][130];
 shared float Bs[16][130];
 
-// ---- 半精度位操作 (同 v7h) ----
+// ---- 半精度位操作 (同 v6h) ----
 float hx(uint u, uint hb) {
 #if HALF_TYPE == 1
     return unpackHalf2x16(u)[hb];
@@ -67,6 +65,12 @@ vec4 load4(uint e, int b) {
     uint u2 = (b == 0 ? A[(e >> 1) + 2u] : B[(e >> 1) + 2u]);
     return vec4(hx(u0, 1u), hx(u1, 0u), hx(u1, 1u), hx(u2, 0u));
 }
+void write2(uint e, float c0, float c1) {
+    C[e >> 1] = f2h(c0) | (f2h(c1) << 16u);
+}
+void write1(uint e, float v) {
+    C[e >> 1] = (C[e >> 1] & 0xFFFF0000u) | f2h(v);
+}
 
 void load_tile(uint kt) {
     uint base_k = kt * 16;
@@ -101,22 +105,16 @@ void load_tile(uint kt) {
         }
 #else
         // A 是 (M×K): A_eff[m][k] = A[m*lda+k], k 连续 4
-        // 合并读版: 相邻 4 线程 (kq=tid&3) 同读一行 4 段 (行内 16 half = 32B 一次取满),
-        // 每线程 4 行 × 4 k; 读 L1 行利用率 4× (行分散读 → 段合并读)
-        uint kq = tid & 3u;
-        uint m4 = tid >> 2;
-        uint ak4 = kq * 4;                       // 本线程 k 段 (局部 0..15)
         for (int r = 0; r < 4; r++) {
-            uint ml = m4 + uint(r) * 32;         // As 列 (tile 局部 0..127)
-            uint mm = base_m + ml;               // 全局行 (读用)
-            if (mm < p.M && base_k + ak4 + 3 < p.K) {
-                vec4 v = load4(aoff + mm * p.lda + base_k + ak4, 0);
-                As[ak4 + 0][ml] = v.x; As[ak4 + 1][ml] = v.y;
-                As[ak4 + 2][ml] = v.z; As[ak4 + 3][ml] = v.w;
+            uint mm = am + r;
+            if (mm < p.M && ak + 3 < p.K) {
+                vec4 v = load4(aoff + mm * p.lda + ak, 0);
+                As[k0 + 0][m0 + r] = v.x; As[k0 + 1][m0 + r] = v.y;
+                As[k0 + 2][m0 + r] = v.z; As[k0 + 3][m0 + r] = v.w;
             } else {
                 for (int c = 0; c < 4; c++) {
-                    uint kk = base_k + ak4 + uint(c);
-                    As[ak4 + uint(c)][ml] = (mm < p.M && kk < p.K) ? load1(aoff + mm * p.lda + kk, 0) : 0.0;
+                    uint kk = ak + uint(c);
+                    As[k0 + c][m0 + r] = (mm < p.M && kk < p.K) ? load1(aoff + mm * p.lda + kk, 0) : 0.0;
                 }
             }
         }
@@ -179,14 +177,9 @@ void main() {
 
     for (uint kt = 0; kt < p.Kt; kt++) {
         for (int kk = 0; kk < 16; kk++) {
-            // 无冲突 vec2 读 (v9 布局): arow[i]=As[kk][lx*2+ii*32+c], brow[j]=Bs[kk][ly*2+jj*32+d]
             float arow[8], brow[8];
-            for (int ii = 0; ii < 4; ii++) {
-                vec2 a = vec2(As[kk][lx * 2 + ii * 32], As[kk][lx * 2 + ii * 32 + 1]);
-                arow[ii * 2 + 0] = a.x; arow[ii * 2 + 1] = a.y;
-                vec2 bv = vec2(Bs[kk][ly * 2 + ii * 32], Bs[kk][ly * 2 + ii * 32 + 1]);
-                brow[ii * 2 + 0] = bv.x; brow[ii * 2 + 1] = bv.y;
-            }
+            for (int i = 0; i < 8; i++) arow[i] = As[kk][lx * 8 + i];
+            for (int j = 0; j < 8; j++) brow[j] = Bs[kk][ly * 8 + j];
             for (int i = 0; i < 8; i++)
                 for (int j = 0; j < 8; j++)
                     acc[i][j] += arow[i] * brow[j];
@@ -198,33 +191,28 @@ void main() {
         }
     }
 
-    // 写 C: 每线程 8 行 × 8 列, 分组与主循环一致 (row=lx*2+ii*32+c, col=ly*2+jj*32+d)
-    // ldc 偶 + N 偶 (host 保证) → 列对 uint 直接写
+    // 写 C: 每线程 8 行 × 8 列; ldc 偶 + N 偶 (host 保证) → 4 对 uint 直接写
     uint coff = b * p.batch_stride_c;
-    for (int ii = 0; ii < 4; ii++) {
-        uint row = base_m + lx * 2 + ii * 32;
-        for (int c = 0; c < 2; c++, row++) {
-            if (row >= p.M) continue;
-            uint cbase = base_n + ly * 2;
-            if (cbase >= p.N) continue;
-            for (int jj = 0; jj < 4; jj++) {
-                for (int d = 0; d < 2; d += 2) {
-                    uint cc = cbase + jj * 32;
-                    // 直通条件 N 偶: 越界列对整对跳过 (行尾单元素仅 N 奇, 不达)
-                    if (cc + 1 >= p.N) continue;
-                    uint e = coff + row * p.ldc + cc;
-                    float c0, c1;
-                    if (p.beta != 0.0) {
-                        vec2 old = hx2(C[e >> 1]);
-                        c0 = p.alpha * acc[ii * 2 + c][jj * 2 + d] + p.beta * old.x;
-                        c1 = p.alpha * acc[ii * 2 + c][jj * 2 + d + 1] + p.beta * old.y;
-                    } else {
-                        c0 = p.alpha * acc[ii * 2 + c][jj * 2 + d];
-                        c1 = p.alpha * acc[ii * 2 + c][jj * 2 + d + 1];
-                    }
-                    C[e >> 1] = f2h(c0) | (f2h(c1) << 16u);
-                }
+    for (int i = 0; i < 8; i++) {
+        uint row = base_m + lx * 8 + i;
+        if (row >= p.M) continue;
+        uint cbase = base_n + ly * 8;
+        if (cbase >= p.N) continue;
+        for (int j = 0; j < 8; j += 2) {
+            uint cc = cbase + uint(j);
+            // 直通条件 N 偶: 越界列直接跳过 (行尾单元素仅 N 奇, 不达)
+            if (cc + 1 >= p.N) continue;
+            uint e = coff + row * p.ldc + cc;
+            float c0, c1;
+            if (p.beta != 0.0) {
+                vec2 old = hx2(C[e >> 1]);
+                c0 = p.alpha * acc[i][j] + p.beta * old.x;
+                c1 = p.alpha * acc[i][j + 1] + p.beta * old.y;
+            } else {
+                c0 = p.alpha * acc[i][j];
+                c1 = p.alpha * acc[i][j + 1];
             }
+            write2(e, c0, c1);
         }
     }
 }
