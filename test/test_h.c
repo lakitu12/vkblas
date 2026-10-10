@@ -95,6 +95,11 @@ int main(void) {
         for (int op_a = 0; op_a < 2; op_a++) {
             for (int op_b = 0; op_b < 2; op_b++) {
                 for (int s = 0; s < nshapes; s++) {
+                    // 固定数据种子 (2026-10-10): COMGR/LLVM (libamd_comgr) 在首次 GPU 调用
+                    // (首个 hipMemcpy) 时会调 srand(随机) 重置全局 rand 流 → 不播种的测试
+                    // 数据跨运行漂移, bf16 大 K case 偶发越过 0.05 阈值造成 flaky FAIL。
+                    // 每 case 自播种, 与 COMGR 插入时机解耦。
+                    srand(0x5EEDu + (unsigned)(s + 7 * (op_b + 2 * (op_a + 2 * dt))));
                     int M = shapes[s][0], N = shapes[s][1], K = shapes[s][2];
                     // 有效区 (带 padding ld)
                     int lda = K + (M % 2), ldb = (op_b ? K : N) + (N % 2), ldc = N + (K % 2);
@@ -162,6 +167,7 @@ int main(void) {
         for (int op_a = 0; op_a < 2; op_a++) {
             for (int op_b = 0; op_b < 2; op_b++) {
                 for (int s = 0; s < nb; s++) {
+                    srand(0xBEEFu + (unsigned)(s + 7 * (op_b + 2 * (op_a + 2 * dt))));   // 同上: 每 case 自播种
                     int M = bshapes[s][0], N = bshapes[s][1], K = bshapes[s][2];
                     int lda = K, ldb = op_b ? K : N, ldc = N;   // 紧密 (ldc=N 偶)
                     size_t ba1 = (size_t)((op_a ? K : M) - 1) * lda + (op_a ? M : K);
