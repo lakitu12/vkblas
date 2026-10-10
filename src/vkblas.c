@@ -1351,10 +1351,18 @@ static int run_fused_half_transpose_gemm(int dtype, int use128, int variant,
     size_t bb_t = (size_t)batch * N * ldb_t * 2;
     cmd_barrier(bBt, bb_t);
     int rc;
-    // VKBLAS_HT256=1 实验门: 256-tile 高 acc 密度变体 (st-even-huge K=40 类瓶颈实验路径;
-    // pipe 缺失自动回退 128-tile)
+    // VKBLAS_HT256 三态: "1"=强制开, "0"=强制关, 未设=自动门 (tiles256×batch >= 512:
+    //   多批/大形状摊薄每 WG 固定成本; 小 WG 场景实测并行度不足反慢 — 见 BACKLOG 10-10)
     const char* ht256 = getenv("VKBLAS_HT256");
-    if (use128 && ht256 != NULL && ht256[0] == '1' && M >= 256 && N >= 256)
+    int want256;
+    if (ht256 != NULL && ht256[0] == '0') want256 = 0;
+    else if (ht256 != NULL && ht256[0] == '1') want256 = 1;
+    else {
+        uint32_t Mt256 = (M + 127) / 128, Nt256 = (N + 255) / 256;
+        uint64_t wg256 = (uint64_t)Mt256 * Nt256 * (batch > 0 ? batch : 1);
+        want256 = (wg256 >= 512);
+    }
+    if (use128 && want256 && M >= 256 && N >= 256)
         rc = run_gemm_h256(dtype, variant, bA, ba, bBt, bb_t, bC, bc,
                            M, N, K, lda, ldb_t, ldc, batch, stride_a,
                            (int64_t)N * ldb_t, stride_c, alpha, beta, 0);
