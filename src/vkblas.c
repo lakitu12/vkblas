@@ -1467,12 +1467,21 @@ static vkblas_status_t gemm_h_direct(int dtype, int hip_physical, vkblas_op_t op
     // 条件: stride 全 ≥0 且 stride_c 偶 (直通写 C 对不变式: e 恒偶)
     // RADV/gfx803 实测: 单次 dispatch 的 batch 维 >16 后 workgroup 调度退化为串行 (与轴无关)
     // → 拆批 ≤16 (每批独立指针偏移, stride 不变)
+    // 10-10 补: x 轴组织 (Mt*nb × Nt) 同样退化 — st-even-huge (4096×4096×40×16)
+    //   nb=16 (16384 WG) 111ms vs nb=1 (1024 WG×16) 44ms, 单调恶化 (nb=2: 57, nb=4: 89)
+    // → 按 WG 预算再拆批: Mt*nb*Nt ≤ 1024 (TT4096 同规模 dispatch 实测满速)
     if (batch > 1 && stride_a >= 0 && stride_b >= 0 && stride_c >= 0 && (stride_c & 1) == 0) {
         uint32_t rem = batch;
         const char* pa2 = pa, *pb2 = pb, *pc2 = pc;
         int rc = 0, fallback = 0;
+        uint32_t Mt_wg = use128 ? (M + 127) / 128 : (M + 63) / 64;
+        uint32_t Nt_wg = use128 ? (N + 127) / 128 : (N + 63) / 64;
+        uint32_t tiles = Mt_wg * Nt_wg > 0 ? Mt_wg * Nt_wg : 1;
+        uint32_t nbcap = 1024 / tiles;
+        if (nbcap < 1) nbcap = 1;
+        if (nbcap > 16) nbcap = 16;
         while (rem > 0) {
-            uint32_t nb = rem > 16 ? 16 : rem;
+            uint32_t nb = rem > nbcap ? nbcap : rem;
             rc = gemm_h_direct_merged(dtype, hip_physical, op_a, op_b, M, N, K,
                                       alpha, pa2, lda, pb2, ldb, beta, pc2, ldc,
                                       nb, stride_a, stride_b, stride_c);
