@@ -1,5 +1,8 @@
 #version 450
-// GEMM f16/bf16 64x64 (原 v6h): tile 64×64 (同 v6: 每线程 4×4=16 acc, LDS 32×66+32×66)
+// GEMM f16/bf16 64x64 bankfree: tile 64×64, BK=32, 256 线程, 每线程 4×4=16 acc
+// = gemm_half_64x64_tmpl.comp 的 loader/写 C + v9 无冲突 LDS 主循环:
+//   vec2 读 As[kk][ly*2+ii*32(+0/1)] / Bs[kk][lx*2+jj*32(+0/1)] → 每 ii 轮 32 次访问落 32 bank 全唯一
+//   (bank 模型见 BACKLOG 10-10; 线程 m/n 映射: m=ly*2+(i/2)*32+(i%2), n=lx*2+(j/2)*32+(j%2))
 // A/B/C 为 2B 半精度位模式 (uint 数组); -D HALF_TYPE=1 (fp16) / 2 (bf16)
 // load 时转 fp32 存 LDS (内循环与 fp32 版一致, 零改动)
 // 写 C: pack 回 2B, 每 2 元素 1 uint; host 保证 ldc 偶且 N 偶 (无跨行共享 uint, 无读改写竞争)
@@ -177,15 +180,15 @@ void main() {
 
     for (uint kt = 0; kt < p.Kt; kt++) {
         for (int kk = 0; kk < 32; kk++) {
+            // 无冲突 vec2 读 (v9 同构): 每 ii 轮 16 线程×2 flt 落 32 bank 全唯一
+            // 线程 m/n 映射: m=ly*2+(i/2)*32+(i%2), n=lx*2+(j/2)*32+(j%2)
             float arow[4], brow[4];
-            arow[0] = As[kk][ly * 4 + 0];
-            arow[1] = As[kk][ly * 4 + 1];
-            arow[2] = As[kk][ly * 4 + 2];
-            arow[3] = As[kk][ly * 4 + 3];
-            brow[0] = Bs[kk][lx * 4 + 0];
-            brow[1] = Bs[kk][lx * 4 + 1];
-            brow[2] = Bs[kk][lx * 4 + 2];
-            brow[3] = Bs[kk][lx * 4 + 3];
+            for (int ii = 0; ii < 2; ii++) {
+                vec2 a = vec2(As[kk][ly * 2 + ii * 32], As[kk][ly * 2 + ii * 32 + 1]);
+                arow[ii * 2 + 0] = a.x; arow[ii * 2 + 1] = a.y;
+                vec2 bv = vec2(Bs[kk][lx * 2 + ii * 32], Bs[kk][lx * 2 + ii * 32 + 1]);
+                brow[ii * 2 + 0] = bv.x; brow[ii * 2 + 1] = bv.y;
+            }
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++)
                     acc[i][j] += arow[i] * brow[j];
@@ -197,16 +200,16 @@ void main() {
         }
     }
 
-    // 写 C: 每线程 4 行 × 4 列; ldc 偶 + N 偶 (host 保证) → 每 2 元素 1 uint 直接写
+    // 写 C: 每线程 4 行 × 4 列 (bankfree 映射, 与主循环 acc 一致):
+    //   row = base_m + ly*2+(i/2)*32+(i%2); cc = base_n + lx*2+(j/2)*32+(j%2)
+    // ldc 偶 + N 偶 (host 保证) → j 步 2 正好一对 uint 直接写
     uint coff = b * p.batch_stride_c;
     for (int i = 0; i < 4; i++) {
-        uint row = base_m + ly * 4 + i;
+        uint row = base_m + ly * 2 + (uint(i) / 2u) * 32u + (uint(i) % 2u);
         if (row >= p.M) continue;
-        uint col = base_n + lx * 4;
-        if (col >= p.N) continue;
         for (int j = 0; j < 4; j += 2) {
-            uint cc = col + uint(j);
-            // 直通条件 N 偶: 越界列 (cc >= N) 直接跳过; 行尾单元素 (cc+1 >= N) 仅 N 奇, 不达
+            uint cc = base_n + lx * 2 + (uint(j) / 2u) * 32u + (uint(j) % 2u);
+            // 直通条件 N 偶: 越界列对整对跳过 (行尾单元素仅 N 奇, 不达)
             if (cc + 1 >= p.N) continue;
             uint e = coff + row * p.ldc + cc;
             float c0, c1;

@@ -179,21 +179,21 @@ $(SHADER_DIR)/gemm_f32_128x128_splitk_tt.spv: $(SHADER_DIR)/gemm_f32_128x128_spl
 $(SHADER_DIR)/splitk_reduce_f32.spv: $(SHADER_DIR)/splitk_reduce_f32.comp
 	glslangValidator -V $< -o $@
 # --- f16/bf16 直通 (HALF_TYPE=1 fp16 / 2 bf16): 64x64 与 128x128 bankconflict, 4 变体 + 转置 ---
-$(SHADER_DIR)/gemm_f16_64x64_nn.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_f16_64x64_nn.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
-$(SHADER_DIR)/gemm_f16_64x64_tn.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_f16_64x64_tn.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=0 $< -o $@
-$(SHADER_DIR)/gemm_f16_64x64_nt.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_f16_64x64_nt.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=1 $< -o $@
-$(SHADER_DIR)/gemm_f16_64x64_tt.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_f16_64x64_tt.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=1 $< -o $@
-$(SHADER_DIR)/gemm_bf16_64x64_nn.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_bf16_64x64_nn.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@
-$(SHADER_DIR)/gemm_bf16_64x64_tn.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_bf16_64x64_tn.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
-$(SHADER_DIR)/gemm_bf16_64x64_nt.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_bf16_64x64_nt.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
-$(SHADER_DIR)/gemm_bf16_64x64_tt.spv: $(SHADER_DIR)/gemm_half_64x64_tmpl.comp
+$(SHADER_DIR)/gemm_bf16_64x64_tt.spv: $(SHADER_DIR)/gemm_half_64x64_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
 $(SHADER_DIR)/gemm_f16_128x128_bankconflict_nn.spv: $(SHADER_DIR)/gemm_half_128x128_bankconflict_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
