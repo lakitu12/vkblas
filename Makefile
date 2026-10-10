@@ -39,6 +39,11 @@ SHADERS = $(SHADER_DIR)/gemm_f32_64x64_nn.spv $(SHADER_DIR)/gemm_f32_64x64_tn.sp
           $(SHADER_DIR)/gemm_f16_128x128_bankfree_nt.spv $(SHADER_DIR)/gemm_f16_128x128_bankfree_tt.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_bankfree_nn.spv $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tn.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_bankfree_nt.spv $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tt.spv \
+          $(SHADER_DIR)/gemm_f16_128x128_splitk_nn.spv $(SHADER_DIR)/gemm_f16_128x128_splitk_nt.spv \
+          $(SHADER_DIR)/gemm_f16_128x128_splitk_tn.spv $(SHADER_DIR)/gemm_f16_128x128_splitk_tt.spv \
+          $(SHADER_DIR)/gemm_bf16_128x128_splitk_nn.spv $(SHADER_DIR)/gemm_bf16_128x128_splitk_nt.spv \
+          $(SHADER_DIR)/gemm_bf16_128x128_splitk_tn.spv $(SHADER_DIR)/gemm_bf16_128x128_splitk_tt.spv \
+          $(SHADER_DIR)/splitk_reduce_hgemm_f16.spv $(SHADER_DIR)/splitk_reduce_hgemm_bf16.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_lds_packed_b64_nn.spv $(SHADER_DIR)/gemm_bf16_128x128_lds_packed_b64_tn.spv \
           $(SHADER_DIR)/gemm_bf16_128x128_lds_packed_b64_nt.spv $(SHADER_DIR)/gemm_bf16_128x128_lds_packed_b64_tt.spv \
           $(SHADER_DIR)/transpose_f16.spv $(SHADER_DIR)/transpose_bf16.spv \
@@ -228,6 +233,26 @@ $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tn.spv: $(SHADER_DIR)/gemm_half_128x128
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
 $(SHADER_DIR)/gemm_bf16_128x128_bankfree_tt.spv: $(SHADER_DIR)/gemm_half_128x128_bankfree_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x128_splitk_nn.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x128_splitk_nt.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x128_splitk_tn.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_f16_128x128_splitk_tt.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=1 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x128_splitk_nn.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x128_splitk_nt.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=1 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x128_splitk_tn.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=0 $< -o $@
+$(SHADER_DIR)/gemm_bf16_128x128_splitk_tt.spv: $(SHADER_DIR)/gemm_half_128x128_splitk_tmpl.comp
+	glslangValidator -V -DHALF_TYPE=2 -DTA=1 -DTB=1 $< -o $@
+$(SHADER_DIR)/splitk_reduce_hgemm_f16.spv: $(SHADER_DIR)/splitk_reduce_hgemm.comp
+	glslangValidator -V -DHALF=1 $< -o $@
+$(SHADER_DIR)/splitk_reduce_hgemm_bf16.spv: $(SHADER_DIR)/splitk_reduce_hgemm.comp
+	glslangValidator -V -DHALF=2 $< -o $@
 # --- half 128x128 lds_packed_b64 2B 打包 LDS 主循环 (原 v9hp; b64 无冲突 + 位模式解包; lds_packed_b128 的 b128 冲突版已证伪) ---
 $(SHADER_DIR)/gemm_bf16_128x128_lds_packed_b64_nn.spv: $(SHADER_DIR)/gemm_half_128x128_lds_packed_b64_tmpl.comp
 	glslangValidator -V -DHALF_TYPE=2 -DTA=0 -DTB=0 $< -o $@

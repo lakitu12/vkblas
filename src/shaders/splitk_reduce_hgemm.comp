@@ -1,0 +1,45 @@
+#version 450
+// split-k reduce (half GEMM 用): Sk[split_k][M][N] fp32 紧密 → C[M][N] 2B 半精度 (ldc 偶, N 偶)
+// C[m][n] = alpha * Σk Sk[k*M*N + m*N+n] + beta * C[m*ldc+n]
+// = splitk_reduce_f32.comp 的写 C 打包版 (每 2 列 1 uint, host 保证 N 偶/ldc 偶, 无跨行共享)
+// -D HALF=1 (fp16) / 2 (bf16)
+#if HALF == 1
+uint f2h(float v) { return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu; }
+float h2f(uint u, uint hb) { return unpackHalf2x16(u)[hb]; }
+#else
+uint f2h(float v) { uint u = floatBitsToUint(v); return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0xFFFFu; }
+float h2f(uint u, uint hb) { return uintBitsToFloat(((u >> (hb * 16u)) & 0xFFFFu) << 16u); }
+#endif
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Sk_buf { float Sk[]; };
+layout(set = 0, binding = 1) buffer C_buf { uint C[]; };
+layout(push_constant) uniform Params {
+    uint ne;        // M*N
+    uint k_num;     // split_k
+    uint N;
+    uint ldc;       // 2B 元素步长 (偶)
+    float alpha, beta;
+} p;
+
+void main() {
+    // 每线程 2 列 (n0 偶) → 1 uint 对齐写
+    uint n0 = gl_GlobalInvocationID.x * 2u;
+    uint m = (n0 / 2u) / (p.N / 2u);
+    uint npair = (n0 / 2u) % (p.N / 2u);
+    uint n = npair * 2u;
+    if (m >= p.ne / p.N) return;
+    if (n + 1 >= p.N) return;
+    uint gid0 = m * p.N + n, gid1 = gid0 + 1u;
+    float s0 = 0.0, s1 = 0.0;
+    for (uint k = 0; k < p.k_num; k++) {
+        s0 += Sk[k * p.ne + gid0];
+        s1 += Sk[k * p.ne + gid1];
+    }
+    float c0 = 0.0, c1 = 0.0;
+    if (p.beta != 0.0) {
+        uint u = C[(m * p.ldc + n) >> 1];
+        c0 = h2f(u, 0u); c1 = h2f(u, 1u);
+    }
+    C[(m * p.ldc + n) >> 1] = f2h(p.alpha * s0 + p.beta * c0) |
+                               (f2h(p.alpha * s1 + p.beta * c1) << 16u);
+}
